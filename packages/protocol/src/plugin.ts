@@ -1,6 +1,4 @@
 // 插件清单 pagent-plugin.json 的类型与校验。插件只能声明，不能执行安装脚本。
-import type { Decision } from './types.ts';
-
 export interface PluginManifest {
   id: string;                      // 反向域名风格：dev.example.web-fetch
   version: string;                 // semver
@@ -13,7 +11,6 @@ export interface PluginManifest {
   };
   permissions: {
     network?: string[];            // host:port，或 *.suffix:port
-    actions?: Record<string, Exclude<Decision, 'ask'> | 'ask'>; // MCP 工具名 → 建议的审批级别
   };
 }
 
@@ -40,11 +37,7 @@ export function validateManifest(m: any): string[] {
   const p = m.permissions;
   if (!p || typeof p !== 'object') errs.push('缺少 permissions（没有权限也要写 {}）');
   for (const t of p?.network ?? []) if (!TARGET_RE.test(t)) errs.push(`network 目标不合法：${t}（格式 host:port）`);
-  for (const [tool, d] of Object.entries(p?.actions ?? {})) {
-    if (!/^[\w-]+$/.test(tool)) errs.push(`actions 工具名不合法：${tool}`);
-    if (!['allow', 'ask', 'deny'].includes(d as string)) errs.push(`actions.${tool} 只能是 allow / ask / deny`);
-  }
-  if (p?.actions && !c?.mcp) errs.push('只有 mcp 插件可以声明 actions');
+  for (const k of Object.keys(p ?? {})) if (k !== 'network') errs.push(`permissions 里不支持 "${k}"（目前只有 network）`);
   return errs;
 }
 
@@ -53,8 +46,5 @@ export const mcpServerName = (pluginId: string) => pluginId.replace(/[^a-z0-9-]/
 
 /** 权限的规范化表示，用来比较"升级后权限是否变了" */
 export function canonicalPermissions(p: PluginManifest['permissions']): string {
-  return JSON.stringify({
-    network: [...(p.network ?? [])].sort(),
-    actions: Object.fromEntries(Object.entries(p.actions ?? {}).sort(([a], [b]) => a.localeCompare(b))),
-  });
+  return JSON.stringify({ network: [...(p.network ?? [])].sort() });
 }

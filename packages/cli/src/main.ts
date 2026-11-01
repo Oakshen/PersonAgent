@@ -65,11 +65,11 @@ function brief(input: unknown): string {
   return s.length > 120 ? s.slice(0, 120) + '…' : s;
 }
 
-async function chat(botName: string, text: string, opts: { newThread: boolean; interrupt: boolean }) {
-  const { threadId, messageId, seq, interrupted } = await call('POST', `/bots/${encodeURIComponent(botName)}/messages`, { text, newThread: opts.newThread, interrupt: opts.interrupt });
+async function chat(botName: string, text: string, opts: { newSession: boolean; interrupt: boolean }): Promise<void> {
+  const { threadId, messageId, seq, interrupted } = await call('POST', `/bots/${encodeURIComponent(botName)}/messages`, { text, newSession: opts.newSession, interrupt: opts.interrupt });
   if (interrupted) console.log(dim(`  已打断 ${interrupted}，新消息排在它后面`));
-  const tty = process.stdin.isTTY;
   let myRun: string | null = null;
+  let ask = null as { question: string; options: string[] } | null;  // 在回调里赋值，TS 推不出来
   await follow(`thread=${threadId}&after=${seq}`, async (e) => {
     if (e.type === 'run.started' && (e.data.messageIds as number[]).includes(messageId)) myRun = e.runId;
     if (!myRun || e.runId !== myRun) return;
@@ -77,32 +77,40 @@ async function chat(botName: string, text: string, opts: { newThread: boolean; i
       case 'assistant.text': console.log(e.data.text); break;
       case 'tool.use': console.log(dim(`  ⚙ ${e.data.name} ${brief(e.data.input)}`)); break;
       case 'tool.result': if (e.data.isError) console.log(red(`  ↳ ${String(e.data.preview).slice(0, 200)}`)); break;
-      case 'action.decided':
-        if (e.data.decision === 'deny') console.log(red(`  ✖ 拒绝：${e.data.reason}`));
-        break;
-      case 'approval.requested': {
-        const id = e.data.approvalId as string;
-        console.log(yellow(`  ? 需要审批 ${id}：${e.data.summary}`));
-        if (tty) {
-          const rl = createInterface({ input: process.stdin, output: process.stdout });
-          const ans = (await rl.question(yellow('    批准？[y/N] '))).trim().toLowerCase();
-          rl.close();
-          await call('POST', `/approvals/${id}`, { decision: ans === 'y' ? 'approve' : 'deny', by: 'cli' })
-            .catch((err) => console.log(red(`    ${err.message}`)));
-        } else {
-          console.log(dim(`    用 pagent approve ${id} 或 pagent deny ${id} 处理`));
-        }
+      case 'memory.updated': console.log(dim(`  ✎ ${describeMemory(e.data)}`)); break;
+      case 'ask.created': {
+        ask = { question: e.data.question as string, options: e.data.options as string[] };
+        console.log(yellow(`  ? ${ask.question}`));
+        ask.options.forEach((o, i) => console.log(yellow(`    ${i + 1}. ${o}`)));
         break;
       }
       case 'run.finished': {
         const d = e.data;
-        const tail = [d.status, d.numTurns != null ? `${d.numTurns} 轮` : null, d.unknownActions ? `${d.unknownActions} 个操作状态未知` : null, d.error]
+        const unconfirmed = (d.unconfirmed as unknown[] | undefined)?.length;
+        const tail = [d.status, d.numTurns != null ? `${d.numTurns} 轮` : null, unconfirmed ? `${unconfirmed} 个操作没等到结果` : null, d.error]
           .filter(Boolean).join('，');
         console.log((d.status === 'succeeded' ? green : red)(`— ${tail}  (${e.runId})`));
         return true;
       }
     }
   });
+  // 它问了问题：终端里直接选，选完接着聊
+  if (ask && process.stdin.isTTY) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const a = (await rl.question(yellow('  选一个编号，或直接输入回答（回车跳过）：'))).trim();
+    rl.close();
+    const pick = /^\d+$/.test(a) ? ask.options[Number(a) - 1] : a;
+    if (pick) return chat(botName, pick, { newSession: false, interrupt: false });
+  }
+}
+
+function describeMemory(d: Record<string, unknown>): string {
+  if (d.scope === 'global') {
+    const op = { add: '记住了', update: '改写了', delete: '删掉了' }[d.op as string] ?? d.op;
+    return `${d.by} ${op}关于你的一条：${d.text ?? d.before}`;
+  }
+  const added = (d.added as string[]) ?? [];
+  return `${d.by} ${d.op === 'delete' ? '删掉了' : '更新了'}自己的记忆 ${d.file}${added.length ? `：${added[0]}` : ''}`;
 }
 
 function table(rows: Record<string, unknown>[], cols: string[]) {
@@ -157,21 +165,20 @@ function describePermissions(m: any): string {
   if (m.contributes?.skills?.length) lines.push(`  提供 Skill：${m.contributes.skills.join(', ')}`);
   if (m.contributes?.mcp) lines.push(`  提供工具（MCP，运行在独立沙箱）`);
   lines.push(`  出网：${p.network?.length ? p.network.join(', ') : '无'}`);
-  for (const [t, d] of Object.entries(p.actions ?? {})) {
-    lines.push(`  工具 ${t}：${d === 'allow' ? yellow('自动放行') : d === 'deny' ? '禁止' : '每次审批'}`);
-  }
   return lines.join('\n');
 }
 
 const USAGE = `用法：
   pagent bot create <name> [--persona 文本] [--model 模型] [--max-turns N]
   pagent bot ls | pagent bot show <name>
-  pagent bot policy <name> '<规则 JSON 数组>'
   pagent bot set <name> [--max-turns N] [--daily-turns N] [--max-seconds N] [--max-actions N]
   pagent backup
-  pagent chat <bot> [--new] [--interrupt] <消息…>
-  pagent approvals | pagent approve <id> | pagent deny <id>
+  pagent chat <bot> [--new] [--interrupt] <消息…>      --new：先开一条新会话（记忆保留）
+  pagent session new <bot>
+  pagent memory [bot]                                  不带 bot：关于你的全局记忆；带 bot：它自己的记忆文件
+  pagent remember <文本…> | pagent forget <记忆编号>
   pagent runs [bot] | pagent run <runId> | pagent interrupt <runId>
+  pagent device pair <设备名> [--scopes chat,admin] | pagent device ls | pagent device revoke <id>
   pagent events [--after N] [-f]
   pagent plugin install <目录> | pagent plugin ls | pagent plugin show <id>
   pagent plugin enable <bot> <id> [--yes] | pagent plugin disable <bot> <id> | pagent plugin bot <bot>`;
@@ -198,26 +205,46 @@ async function main(argv: string[]) {
         });
         return console.log(`${b.name}：maxTurns=${b.maxTurns} dailyTurnBudget=${b.dailyTurnBudget} maxRunSeconds=${b.maxRunSeconds} maxActions=${b.maxActions}`);
       }
-      if (sub === 'policy') return console.log(JSON.stringify((await call('PATCH', `/bots/${encodeURIComponent(name)}`, { policy: JSON.parse(rest[0]) })).policy, null, 2));
       break;
     }
     case 'chat': {
-      const newThread = args.includes('--new');
+      const newSession = args.includes('--new');
       const interrupt = args.includes('--interrupt');
       const [bot, ...words] = args.filter((a) => a !== '--new' && a !== '--interrupt');
       if (!bot || !words.length) break;
-      return chat(bot, words.join(' '), { newThread, interrupt });
+      return chat(bot, words.join(' '), { newSession, interrupt });
     }
-    case 'action': {
-      const [sub, id, outcome, ...note] = args;
-      if (sub !== 'resolve' || !id || !outcome) break;
-      await call('POST', `/actions/${id}/resolve`, { outcome, note: note.join(' ') || undefined });
-      return console.log('已核对');
+    case 'session': {
+      if (args[0] !== 'new' || !args[1]) break;
+      await call('POST', `/bots/${encodeURIComponent(args[1])}/session`);
+      return console.log(`${args[1]} 已换新会话，记忆都还在`);
+    }
+    case 'memory': {
+      if (!args[0]) {
+        const list = await call<any[]>('GET', '/memory');
+        if (!list.length) return console.log(dim('（还没有关于你的记忆）'));
+        for (const m of list) console.log(`${dim(m.id)}  ${m.text}  ${dim(`— ${m.sourceBot ?? '你自己'}，${m.updatedAt.slice(0, 16)}`)}`);
+        return;
+      }
+      const files = await call<{ file: string; content: string }[]>('GET', `/bots/${encodeURIComponent(args[0])}/memory`);
+      if (!files.length) return console.log(dim('（它还没有写过记忆）'));
+      for (const f of files) console.log(`${green(`== ${f.file}`)}\n${f.content.trimEnd()}\n`);
+      return;
+    }
+    case 'remember': {
+      if (!args.length) break;
+      const m = await call('POST', '/memory', { text: args.join(' ') });
+      return console.log(`已记住（${m.id}），所有 Agent 下一轮起都能看到`);
+    }
+    case 'forget': {
+      if (!args[0]) break;
+      await call('DELETE', `/memory/${args[0]}`);
+      return console.log('已删除');
     }
     case 'device': {
       const [sub, a1, ...rest] = args;
       if (sub === 'pair' && a1) {
-        const scopes = (flag(rest, '--scopes') ?? 'chat,approve,admin').split(',');
+        const scopes = (flag(rest, '--scopes') ?? 'chat,admin').split(',');
         const p = await call('POST', '/devices/pair', { name: a1, scopes });
         const base = process.env.PAGENT_REMOTE_URL ?? 'http://localhost:7780';
         console.log(`配对码：${p.code.replace(/(.{5})/, '$1-')}（${scopes.join(', ')}，${p.expiresAt} 前有效，只能用一次）`);
@@ -230,12 +257,6 @@ async function main(argv: string[]) {
     }
     case 'backup':
       return console.log(`已备份到 ${(await call('POST', '/backup')).file}`);
-    case 'approvals':
-      return table(await call('GET', '/approvals'), ['id', 'run_id', 'summary', 'expires_at']);
-    case 'approve':
-    case 'deny':
-      await call('POST', `/approvals/${args[0]}`, { decision: cmd, by: 'cli' });
-      return console.log(cmd === 'approve' ? '已批准' : '已拒绝');
     case 'runs':
       return table(await call('GET', `/runs${args[0] ? `?bot=${encodeURIComponent(args[0])}` : ''}`), ['id', 'status', 'num_turns', 'cost_usd', 'started_at', 'error']);
     case 'run': {

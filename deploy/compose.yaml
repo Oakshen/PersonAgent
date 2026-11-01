@@ -44,7 +44,7 @@ services:
       PAGENT_EGRESS_RULES: ${PAGENT_DATA}/egress-rules.json
       PAGENT_WORKER_USER: "${PAGENT_UID}:${PAGENT_UID}"
       PAGENT_HOST_CRED: ${PAGENT_HOST_CRED:-}
-      PAGENT_WORKER_ALLOW: api.anthropic.com:443,platform.claude.com:443,console.anthropic.com:443,claude.ai:443
+      PAGENT_WORKER_ALLOW: "*"          # 放行公网；局域网和元数据地址由 egress 挡住
       PAGENT_WEB_DIR: ${PAGENT_SRC}/packages/web
     # 远程入口只发布到宿主回环地址；手机经 tailscale serve（HTTPS）访问
     ports:

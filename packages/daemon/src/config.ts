@@ -11,15 +11,16 @@ export const config = {
   sock: env('PAGENT_SOCK'),
   assetsDir: env('PAGENT_ASSETS'),
   egressRulesFile: env('PAGENT_EGRESS_RULES'),
-  hookHost: env('PAGENT_HOOK_HOST', 'pagentd'),
-  hookPort: Number(env('PAGENT_HOOK_PORT', '7701')),
+  // worker 经沙箱网络访问 pagentd 提供的 MCP（remember / ask_user / new_session）
+  mcpHost: env('PAGENT_MCP_HOST', 'pagentd'),
+  mcpPort: Number(env('PAGENT_MCP_PORT', '7701')),
   workerImage: env('PAGENT_WORKER_IMAGE', 'pagent-worker'),
   workerUser: env('PAGENT_WORKER_USER', '10001:10001'),
   workerMemory: env('PAGENT_WORKER_MEMORY', '1500m'),
-  workerAllow: env('PAGENT_WORKER_ALLOW', 'api.anthropic.com:443').split(','),
+  // worker 出网：默认放行公网（局域网和元数据地址由 egress 代理挡住）
+  workerAllow: env('PAGENT_WORKER_ALLOW', '*').split(','),
   hostCred: process.env.PAGENT_HOST_CRED || null,
   sandboxNet: env('PAGENT_SANDBOX_NET', 'pagent_sandbox'),
-  approvalTtlSec: Number(env('PAGENT_APPROVAL_TTL', '540')),
   remotePort: Number(env('PAGENT_REMOTE_PORT', '7780')),
   webDir: env('PAGENT_WEB_DIR'),
 };

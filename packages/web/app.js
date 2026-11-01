@@ -1,5 +1,6 @@
-// PersonAgent Web 控制台（参照 Grok Bot Mac 客户端）。无框架；所有文本经 textContent 写入，配合严格 CSP。
+// PersonAgent Web 控制台。无框架；所有文本经 textContent 写入，配合严格 CSP。
 // 设备私钥在本机生成、不可导出，存在 IndexedDB；服务器只拿到公钥。
+// 聊天中途没有任何审批：Agent 直接把事做完。它需要你拿主意时会发一张选择卡。
 
 const $shell = document.getElementById('shell');
 const $side = document.getElementById('side');
@@ -10,17 +11,19 @@ const S = {
   device: null,          // { deviceId, name, keys }
   token: null,
   conn: 'off',
-  bots: [], approvals: [], unknown: [],
+  bots: [],
   seq: 0,
-  view: 'home',          // home | chat | inbox
+  view: 'home',          // home | chat | memory | about
   bot: null,
   history: [],
   running: new Map(),    // botId → runId
   query: null,           // 搜索词；null 表示没打开搜索
   pins: JSON.parse(localStorage.getItem('pagent.pins') ?? '[]'),
+  globals: [],           // 关于我（全局记忆）
+  files: [],             // 当前 Bot 的记忆文件
 };
 
-const STATUS_TEXT = { working: '工作中…', waiting: '等你批准', attention: '有操作需要核对', failed: '上一轮失败' };
+const STATUS_TEXT = { working: '工作中…', asking: '在等你回答', failed: '上一轮失败' };
 
 // ---------- 小工具 ----------
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -43,7 +46,6 @@ function s(tag, attrs = {}, ...kids) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
-const narrow = () => matchMedia('(max-width: 760px)').matches;
 function toast(text) {
   const t = h('div', { class: 'toast', role: 'status' }, text);
   document.body.append(t);
@@ -54,16 +56,20 @@ function brief(input) {
   const v = String(o.command ?? o.file_path ?? o.pattern ?? o.url ?? o.skill ?? o.query ?? JSON.stringify(o));
   return v.length > 200 ? v.slice(0, 200) + '…' : v;
 }
+const enc = encodeURIComponent;
+/** 名单预览用：去掉 Markdown 记号 */
+const plain = (t) => t == null ? null : String(t).replace(/```[\s\S]*?```/g, ' ').replace(/[*`#>_]+/g, '').replace(/\s+/g, ' ').trim();
+const canAdmin = () => !!S.device?.scopes?.includes('admin');
 const icon = {
   search: () => s('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round' },
     s('circle', { cx: 11, cy: 11, r: 7 }), s('path', { d: 'M20 20l-3.5-3.5' })),
+  arrow: () => s('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2.4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+    s('path', { d: 'M12 19V5M5 12l7-7 7 7' })),
   plus: () => s('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round' },
     s('path', { d: 'M12 5v14M5 12h14' })),
-  inbox: () => s('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linejoin': 'round' },
-    s('path', { d: 'M4 13l2.5-7h11L20 13v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z' }), s('path', { d: 'M4 13h5l1 2h4l1-2h5' })),
 };
 
-// ---------- 头像：方印。取名字的第一个字，颜色由名字决定 ----------
+// ---------- 头像：取名字的第一个字，颜色由名字决定 ----------
 const COLORS = ['#2F6B4F', '#3E5C8A', '#8A5A3C', '#6B4E8A', '#2F7D7A', '#9A6B1F', '#A33F3F', '#4D6B2F'];
 function hash(str) {
   let x = 2166136261;
@@ -196,14 +202,11 @@ const refreshSoon = () => { clearTimeout(refreshTimer); refreshTimer = setTimeou
 async function refreshState() {
   const st = await api('GET', '/api/state');
   S.bots = st.bots;
-  S.approvals = st.approvals;
-  S.unknown = st.unknownActions;
   if (!S.seq) S.seq = st.seq;
   if (S.bot) S.bot = S.bots.find((b) => b.id === S.bot.id) ?? S.bot;
   renderSide();
-  if (S.view === 'inbox') renderMain();
-  else if (S.view === 'chat') { renderLog(); renderComposer(); }
-  else renderMain();
+  if (S.view === 'chat') { renderHead(); renderLog(); renderComposer(); }
+  else if (S.view === 'home') renderMain();
 }
 
 async function openBot(bot) {
@@ -211,11 +214,24 @@ async function openBot(bot) {
   S.view = 'chat';
   S.history = [];
   render();
-  S.history = await api('GET', `/api/bots/${encodeURIComponent(bot.name)}/history?limit=400`);
+  S.history = await api('GET', `/api/bots/${enc(bot.name)}/history?limit=400`);
   for (const e of S.history) trackRunning(e);
   renderLog(true);
   renderComposer();
   document.querySelector('.composer textarea')?.focus();
+}
+
+async function openMemory(bot) {
+  S.bot = bot;
+  S.view = 'memory';
+  S.files = await api('GET', `/api/bots/${enc(bot.name)}/memory`);
+  render();
+}
+
+async function openAbout() {
+  S.view = 'about';
+  S.globals = await api('GET', '/api/memory');
+  render();
 }
 
 function trackRunning(e) {
@@ -230,9 +246,13 @@ function onEvent(e) {
   if (S.bot && e.botId === S.bot.id && S.view === 'chat') {
     S.history.push(e);
     renderLog();
-    if (e.type === 'run.started' || e.type === 'run.finished') renderComposer();
+    if (/^(run\.started|run\.finished|ask\.)/.test(e.type)) renderComposer();
   }
-  if (/^(run|approval|action|device|bot|message|assistant)\./.test(e.type)) refreshSoon();
+  if (e.type === 'memory.updated') {
+    if (S.view === 'about' && e.data.scope === 'global') openAbout().catch(() => {});
+    if (S.view === 'memory' && e.data.scope === 'agent' && e.botId === S.bot?.id) openMemory(S.bot).catch(() => {});
+  }
+  if (/^(run|ask|device|bot|message|assistant|session)\./.test(e.type)) refreshSoon();
 }
 
 /** 事件流：用 fetch 读 SSE（token 放请求头而不是 URL）。断线后带游标续传，不重不漏。 */
@@ -275,20 +295,19 @@ function setConn(state) {
 }
 
 // ---------- 操作 ----------
-async function decide(id, decision) {
-  try { await api('POST', `/api/approvals/${id}`, { decision }); toast(decision === 'approve' ? '已批准' : '已拒绝'); }
-  catch (e) { toast(e.message); }
-  refreshSoon();
-}
-async function reconcile(id, outcome) {
-  try { await api('POST', `/api/actions/${id}/resolve`, { outcome }); toast('已核对'); }
-  catch (e) { toast(e.message); }
-  refreshSoon();
+async function sendText(text, opts = {}) {
+  await api('POST', `/api/bots/${enc(S.bot.name)}/messages`, { text, interrupt: !!opts.interrupt });
 }
 function togglePin(bot) {
   S.pins = S.pins.includes(bot.id) ? S.pins.filter((x) => x !== bot.id) : [...S.pins, bot.id].slice(-6);
   localStorage.setItem('pagent.pins', JSON.stringify(S.pins));
   renderSide();
+}
+async function newSession(bot) {
+  try {
+    await api('POST', `/api/bots/${enc(bot.name)}/session`);
+    toast('已开新会话，它的记忆都还在');
+  } catch (e) { toast(e.message); }
 }
 
 // ---------- 渲染：侧栏 ----------
@@ -305,21 +324,20 @@ function renderSide() {
   const pinned = S.pins.map((id) => bots.find((b) => b.id === id)).filter(Boolean);
   const rest = bots.filter((b) => !S.pins.includes(b.id))
     .sort((a, b) => (b.lastAt ?? b.createdAt ?? '').localeCompare(a.lastAt ?? a.createdAt ?? ''));
-  const canAdmin = S.device.scopes?.includes('admin');
+  const current = (b) => (S.view === 'chat' || S.view === 'memory') && S.bot?.id === b.id;
   const row = (b) => {
     const st = STATUS_TEXT[b.status];
-    return h('button', { class: 'row', 'aria-current': S.view === 'chat' && S.bot?.id === b.id ? 'true' : null, onclick: () => openBot(b) },
+    return h('button', { class: 'row', 'aria-current': current(b) ? 'true' : null, onclick: () => openBot(b) },
       seal(b.name, 38, b.status),
       h('span', { class: 'txt' },
         h('div', { class: 'name' }, b.name),
-        h('div', { class: `prev ${b.status === 'waiting' ? 'wait' : b.status === 'attention' ? 'attention' : ''}` },
-          st ?? b.lastText ?? b.persona ?? '还没有对话')));
+        h('div', { class: `prev ${b.status === 'asking' ? 'ask' : ''}` }, st ?? plain(b.lastText) ?? b.persona ?? '还没有对话')));
   };
 
   const top = h('div', { class: 'side-top' },
     h('div', { class: 'wordmark' }, 'PersonAgent', h('small', {}, `${S.bots.length} 个 BOT`)),
     h('button', { class: 'round', title: '搜索', 'aria-label': '搜索', onclick: () => { S.query = S.query === null ? '' : null; renderSide(); document.querySelector('.search input')?.focus(); } }, icon.search()),
-    canAdmin ? h('button', { class: 'round', title: '新建 Bot', 'aria-label': '新建 Bot', onclick: () => editBotDialog() }, icon.plus()) : null);
+    canAdmin() ? h('button', { class: 'round', title: '新建 Bot', 'aria-label': '新建 Bot', onclick: () => editBotDialog() }, icon.plus()) : null);
 
   const scroll = h('div', { class: 'side-scroll' });
   if (S.query !== null) {
@@ -331,14 +349,13 @@ function renderSide() {
   if (pinned.length) scroll.append(h('div', { class: 'group' }, '置顶'), ...pinned.map(row));
   if (rest.length) scroll.append(h('div', { class: 'group' }, pinned.length ? '其他' : '全部'), ...rest.map(row));
   if (!S.bots.length) {
-    scroll.append(h('p', { class: 'side-empty' }, canAdmin ? '还没有 Bot。点右上角的 + 新建一个。' : '还没有 Bot。在服务器上运行 pagent bot create <名字> 新建一个。'));
+    scroll.append(h('p', { class: 'side-empty' }, canAdmin() ? '还没有 Bot。点右上角的 + 新建一个。' : '还没有 Bot。在服务器上运行 pagent bot create <名字> 新建一个。'));
   }
 
-  const pending = S.approvals.length + S.unknown.length;
   const bottom = h('div', { class: 'side-bottom' },
     h('div', { class: 'me' }, S.device.name ?? '这台设备',
       h('small', { class: 'conn', dataset: { state: S.conn } }, { on: '已连接', retry: '重连中', off: '离线' }[S.conn])),
-    h('button', { class: 'inbox-btn', onclick: () => { S.view = 'inbox'; render(); } }, '待处理', pending ? h('b', {}, pending) : null));
+    h('button', { class: 'about-btn', 'aria-current': S.view === 'about' ? 'true' : null, onclick: () => openAbout().catch((e) => toast(e.message)) }, '关于我'));
 
   $side.replaceChildren(top, scroll, bottom);
 }
@@ -346,40 +363,54 @@ function renderSide() {
 // ---------- 渲染：主区 ----------
 function renderMain() {
   if (!S.device) return;
-  if (S.view === 'inbox') return renderInbox();
+  if (S.view === 'about') return renderAbout();
+  if (S.view === 'memory') return renderMemory();
   if (S.view !== 'chat' || !S.bot) {
     return $main.replaceChildren(h('div', { class: 'welcome' },
       h('h2', {}, '选一个 Bot 开始'),
-      h('p', {}, '每个 Bot 有自己的上下文和记忆。它要执行有风险的操作时，会先来问你。')));
+      h('p', {}, '每个 Bot 有自己的会话和记忆，交代的事它会直接做完。需要你拿主意时，它会发一张选择卡。')));
   }
-  const b = S.bot;
-  const head = h('header', { class: 'chat-head' },
-    h('button', { class: 'back-btn', 'aria-label': '返回', onclick: () => { S.view = 'home'; render(); } }, '‹'),
-    seal(b.name, 36, b.status),
-    h('div', { class: 'who' }, h('b', {}, b.name), h('small', {}, b.persona || '没有设定人设')),
-    h('button', { class: 'head-btn', onclick: () => botMenu(b) }, '设置'));
-  $main.replaceChildren(head, h('div', { class: 'log', id: 'log', 'aria-live': 'polite' }), h('div', { id: 'composer-slot' }));
+  $main.replaceChildren(h('header', { class: 'chat-head', id: 'head' }), h('div', { class: 'log', id: 'log', 'aria-live': 'polite' }), h('div', { id: 'composer-slot' }));
+  renderHead();
   renderLog(true);
   renderComposer();
+}
+
+function renderHead() {
+  const head = document.getElementById('head');
+  if (!head || !S.bot) return;
+  const b = S.bot;
+  head.replaceChildren(
+    h('button', { class: 'back-btn', 'aria-label': '返回', onclick: () => { S.view = 'home'; render(); } }, '‹'),
+    seal(b.name, 36, b.status),
+    h('div', { class: 'who' }, h('b', {}, b.name), h('small', {}, STATUS_TEXT[b.status] ?? (b.persona || '没有设定人设'))),
+    h('button', { class: 'head-btn', onclick: () => openMemory(b).catch((e) => toast(e.message)) }, '它记得什么'),
+    h('button', { class: 'head-btn', onclick: () => botMenu(b) }, '设置'));
 }
 
 function renderLog(toEnd = false) {
   const log = document.getElementById('log');
   if (!log || !S.bot) return;
   const atEnd = toEnd || log.scrollHeight - log.scrollTop - log.clientHeight < 100;
-  const resolved = new Map();
-  for (const e of S.history) if (e.type === 'approval.resolved') resolved.set(e.data.approvalId, e.data.status);
+  // 选择卡只有最近一张、且之后没有你的消息和新会话时才能点
+  const answered = new Map();
+  let openAsk = null;
+  for (const e of S.history) {
+    if (e.type === 'ask.created') openAsk = e.data.askId;
+    if (e.type === 'ask.answered') answered.set(e.data.askId, e.data.answer);
+    if (e.type === 'message.queued' || e.type === 'session.new') openAsk = null;
+  }
   const nodes = [];
   let lastTs = 0;
   for (const e of S.history) {
-    const node = renderEvent(e, resolved);
+    const node = renderEvent(e, { answered, openAsk });
     if (!node) continue;
     const t = Date.parse(e.ts);
-    if (t - lastTs > 10 * 60_000) nodes.push(h('div', { class: 'time' }, timeLabel(e.ts)));
+    if (t - lastTs > 10 * 60_000 && e.type !== 'session.new') nodes.push(h('div', { class: 'time' }, timeLabel(e.ts)));
     lastTs = t;
     nodes.push(node);
   }
-  if (S.running.get(S.bot.id) && S.history.at(-1)?.type !== 'approval.requested') nodes.push(h('div', { class: 'end' }, `${S.bot.name} 正在处理…`));
+  if (S.running.get(S.bot.id)) nodes.push(h('div', { class: 'end' }, `${S.bot.name} 正在处理…`));
   log.style.setProperty('--c', colorOf(S.bot.name));
   if (!nodes.length) {
     nodes.push(h('div', { class: 'welcome' }, seal(S.bot.name, 72), h('h2', {}, S.bot.name),
@@ -389,51 +420,74 @@ function renderLog(toEnd = false) {
   if (atEnd) log.scrollTop = log.scrollHeight;
 }
 
-function renderEvent(e, resolved) {
+function memoryLine(d) {
+  if (d.scope === 'global') {
+    const verb = { add: '记下了关于你的一条', update: '改写了关于你的一条', delete: '删掉了关于你的一条' }[d.op] ?? '改了关于你的记忆';
+    return h('div', { class: 'memline global' }, h('span', { class: 'stamp' }), `${d.by} ${verb}：`, h('q', {}, d.text ?? d.before ?? ''));
+  }
+  const added = d.added ?? [];
+  return h('div', { class: 'memline' }, h('span', { class: 'stamp' }),
+    `${d.by} ${d.op === 'delete' ? '删掉了' : '更新了'}自己的记忆 `, h('code', {}, d.file),
+    added.length ? h('q', {}, added[0].replace(/^[-*]\s*/, '')) : null);
+}
+
+function renderEvent(e, ctx) {
   const d = e.data;
   switch (e.type) {
     case 'message.queued': return h('div', { class: 'mine' }, d.text);
     case 'assistant.text': return h('div', { class: 'say' }, md(d.text));
-    case 'tool.use': return h('div', { class: 'step', title: brief(d.input) }, `${d.name}  ${brief(d.input)}`);
+    case 'tool.use':
+      if (d.name === 'mcp__pagent__ask_user' || d.name === 'mcp__pagent__remember' || d.name === 'ToolSearch') return null;
+      return h('div', { class: 'step', title: d.summary ?? brief(d.input) }, `${d.name.replace(/^mcp__[^_]+__/, '')}  ${d.summary ?? brief(d.input)}`);
     case 'tool.result': return d.isError ? h('div', { class: 'step bad' }, String(d.preview).slice(0, 300)) : null;
-    case 'action.decided': return d.decision === 'deny' && !/用户拒绝|审批/.test(d.reason) ? h('div', { class: 'step bad' }, `已拦下：${d.reason}`) : null;
-    case 'action.reconciled': return h('div', { class: 'step note' }, `已核对：${d.outcome === 'happened' ? '确实发生了' : '没有发生'}`);
-    case 'approval.requested': return approvalCard({ id: d.approvalId, summary: d.summary, expires_at: d.expiresAt, created: e.ts }, resolved.get(d.approvalId));
+    case 'memory.updated': return memoryLine(d);
+    case 'ask.created': return askCard(d, ctx.answered.get(d.askId), ctx.openAsk === d.askId);
+    case 'session.new': return h('div', { class: 'divider' }, h('span', {}, '新会话'), h('small', {}, d.reason ? `${d.reason} · 记忆保留` : '上下文清空，记忆保留'));
+    case 'session.compacted': return h('div', { class: 'step note' }, '对话太长，已自动压缩；记忆不受影响');
     case 'run.finished': {
-      if (d.status === 'succeeded') return null;
-      const label = { failed: '这一轮失败了', interrupted: '已停止', unknown: '这一轮被打断，有操作需要你核对' }[d.status] ?? d.status;
-      return h('div', { class: 'end bad' }, [label, d.error].filter(Boolean).join('：').slice(0, 200));
+      const nodes = [];
+      if (d.status !== 'succeeded') {
+        const label = { failed: '这一轮失败了', interrupted: '已停止' }[d.status] ?? d.status;
+        nodes.push(h('div', { class: 'end bad' }, [label, d.error].filter(Boolean).join('：').slice(0, 200)));
+      }
+      if (d.unconfirmed?.length) {
+        nodes.push(h('div', { class: 'step note' }, `有 ${d.unconfirmed.length} 个操作没等到结果（${d.unconfirmed.map((a) => a.tool).join('、')}），下一轮它会自己核实`));
+      }
+      return nodes.length ? h('div', { class: 'stack' }, ...nodes) : null;
     }
     case 'plugin.needs_consent': return h('div', { class: 'step note' }, `插件 ${d.plugins.join('、')} 的权限变了，需要在服务器上重新启用`);
     default: return null;
   }
 }
 
-/** 审批工单：上联是要执行的命令，撕口线上是倒计时，下联是决定 */
-function approvalCard(a, status, botName) {
-  const pending = !status && S.approvals.some((p) => p.id === a.id);
-  const [tool, ...rest] = a.summary.split(': ');
-  const tear = h('div', { class: 'tear' });
-  const bottom = h('div', { class: 'bottom' });
-  if (pending) {
-    const mins = Math.max(1, Math.round((Date.parse(a.expires_at) - Date.now()) / 60000));
-    tear.append(h('i', { class: 'fuse', dataset: { start: Date.parse(a.created ?? a.created_at), end: Date.parse(a.expires_at) } }));
-    bottom.append(
-      h('span', { class: 'left' }, `${mins} 分钟内不处理就自动拒绝`),
-      h('button', { class: 'btn', onclick: () => decide(a.id, 'deny') }, '拒绝'),
-      h('button', { class: 'btn go', onclick: () => decide(a.id, 'approve') }, '放行'));
-  } else {
-    const [text, cls] = {
-      approved: ['已放行', 'ok'], denied: ['已拒绝', 'bad'], expired: ['超时未处理，已自动拒绝', 'bad'], cancelled: ['这一轮已结束，工单作废', 'bad'],
-    }[status] ?? ['已处理', ''];
-    bottom.append(h('span', { class: `state ${cls}` }, text));
+/** 选择卡：问题 + 选项；点一个就是回答，它接着做 */
+function askCard(d, answer, open) {
+  const options = h('div', { class: 'options' });
+  const choose = async (text, btn) => {
+    for (const b of options.querySelectorAll('button')) b.disabled = true;
+    btn?.classList.add('picked');
+    try { await sendText(text); } catch (e) { toast(e.message); for (const b of options.querySelectorAll('button')) b.disabled = false; }
+  };
+  d.options.forEach((o, i) => {
+    const btn = h('button', { class: `opt ${answer === o ? 'picked' : ''}`, disabled: !open },
+      h('span', { class: 'n' }, String(i + 1)), h('span', {}, o));
+    btn.addEventListener('click', () => choose(o, btn));
+    options.append(btn);
+  });
+  if (open && d.allowCustom) {
+    const input = h('input', { placeholder: '都不合适？自己写', 'aria-label': '自己写回答' });
+    const go = h('button', { class: 'btn', type: 'submit' }, '回答');
+    const form = h('form', { class: 'custom' }, input, go);
+    form.addEventListener('submit', (ev) => { ev.preventDefault(); if (input.value.trim()) choose(input.value.trim()); });
+    options.append(form);
   }
-  return h('article', { class: 'ticket' },
+  const custom = answer && !d.options.includes(answer);
+  return h('article', { class: `ticket ask ${open ? 'open' : ''}` },
     h('div', { class: 'top' },
-      h('div', { class: 'label' }, pending ? '等你批准' : '审批'),
-      h('div', { class: 'q' }, botName ? `${botName} 想执行 ` : '想执行 ', h('b', {}, tool)),
-      h('pre', {}, rest.join(': ') || a.summary)),
-    tear, bottom);
+      h('div', { class: 'label' }, open ? '等你回答' : answer ? '已回答' : '已作废'),
+      h('div', { class: 'q' }, d.question)),
+    options,
+    custom ? h('div', { class: 'answer' }, `你的回答：${answer}`) : null);
 }
 
 function renderComposer() {
@@ -441,15 +495,15 @@ function renderComposer() {
   if (!slot || !S.bot) return;
   const running = S.running.get(S.bot.id);
   const input = h('textarea', { rows: 1, placeholder: running ? `${S.bot.name} 正在工作，发消息会先打断它` : `给 ${S.bot.name} 发消息`, 'aria-label': '消息' });
-  const sendBtn = h('button', { class: 'send', disabled: true }, running ? '打断并发送' : '发送');
+  const sendBtn = running
+    ? h('button', { class: 'send', disabled: true }, '打断并发送')
+    : h('button', { class: 'send icon', disabled: true, 'aria-label': '发送', title: '发送' }, icon.arrow());
   const send = async () => {
     const text = input.value.trim();
     if (!text) return;
     input.value = '';
     sendBtn.disabled = true;
-    try {
-      await api('POST', `/api/bots/${encodeURIComponent(S.bot.name)}/messages`, { text, interrupt: !!S.running.get(S.bot.id) });
-    } catch (e) { toast(e.message); input.value = text; }
+    try { await sendText(text, { interrupt: !!S.running.get(S.bot.id) }); } catch (e) { toast(e.message); input.value = text; }
   };
   input.addEventListener('input', () => {
     sendBtn.disabled = !input.value.trim();
@@ -467,41 +521,89 @@ function renderComposer() {
   if (old === document.activeElement) input.focus();
 }
 
-function renderInbox() {
-  const box = h('section', { class: 'inbox' });
-  const botName = (id) => S.bots.find((b) => b.id === id)?.name ?? id;
+// ---------- 它记得什么（Agent 自己的记忆文件） ----------
+function renderMemory() {
+  const b = S.bot;
+  const head = h('header', { class: 'chat-head' },
+    h('button', { class: 'back-btn show', 'aria-label': '返回对话', onclick: () => openBot(b) }, '‹'),
+    seal(b.name, 36, b.status),
+    h('div', { class: 'who' }, h('b', {}, `${b.name} 记得什么`), h('small', {}, '它自己的工作记忆：负责的事、做过的决定、工作方法')),
+    h('button', { class: 'head-btn', onclick: () => openBot(b) }, '回到对话'));
+  const page = h('section', { class: 'page' });
+  page.append(h('p', { class: 'hint' }, '它在对话中学到的东西会当场写在这里。你改动后，下一轮对话生效。关于你本人的事记在「关于我」里，所有 Bot 共享。'));
+  const index = S.files.find((f) => f.file === 'MEMORY.md');
+  const files = index ? [index, ...S.files.filter((f) => f !== index)] : S.files;
+  if (!files.length) page.append(h('div', { class: 'empty' }, `${b.name} 还没有写下任何记忆。和它多聊几次，或者在对话里直接说"记住……"。`));
+  for (const f of files) page.append(memFile(b, f));
+  if (canAdmin()) {
+    page.append(h('button', { class: 'btn add-file', onclick: () => {
+      const name = prompt('新文件名（以 .md 结尾）', '笔记.md');
+      if (name) saveFile(b, name, '');
+    } }, '新建记忆文件'));
+  }
+  $main.replaceChildren(head, page);
+}
+
+function memFile(b, f) {
+  const lines = f.content.split('\n').filter((l) => l.trim()).length;
+  const body = canAdmin()
+    ? h('textarea', { class: 'mem-text', spellcheck: 'false', 'aria-label': f.file }, f.content)
+    : h('pre', { class: 'mem-text' }, f.content);
+  const actions = canAdmin() ? h('div', { class: 'file-btns' },
+    h('button', { class: 'btn', onclick: () => confirm(`删除 ${f.file}？`) && saveFile(b, f.file, null) }, '删除'),
+    h('button', { class: 'btn go', onclick: () => saveFile(b, f.file, body.value) }, '保存')) : null;
+  return h('article', { class: 'memfile' },
+    h('div', { class: 'file-head' }, h('code', {}, f.file), h('small', {}, f.file === 'MEMORY.md' ? `索引 · ${lines} 行` : `${lines} 行`)),
+    body, actions);
+}
+
+async function saveFile(b, file, content) {
+  try {
+    if (content === null) await api('DELETE', `/api/bots/${enc(b.name)}/memory/${enc(file)}`);
+    else await api('PUT', `/api/bots/${enc(b.name)}/memory/${enc(file)}`, { content });
+    toast(content === null ? '已删除' : '已保存，下一轮生效');
+    await openMemory(b);
+  } catch (e) { toast(e.message); }
+}
+
+// ---------- 关于我（全局记忆） ----------
+function renderAbout() {
   const head = h('header', { class: 'chat-head' },
     h('button', { class: 'back-btn', 'aria-label': '返回', onclick: () => { S.view = 'home'; render(); } }, '‹'),
-    h('div', { class: 'who' }, h('b', {}, '待处理'), h('small', {}, '需要你批准或核对的事')));
-  if (S.approvals.length) {
-    box.append(h('h3', {}, `等你批准 · ${S.approvals.length}`));
-    for (const a of S.approvals) box.append(approvalCard(a, null, botName(a.bot_id)));
+    h('div', { class: 'who' }, h('b', {}, '关于我'), h('small', {}, `所有 Bot 都知道的事 · ${S.globals.length} 条`)));
+  const page = h('section', { class: 'page' });
+  page.append(h('p', { class: 'hint' }, 'Bot 在对话里了解到关于你的事，会记在这里，所有 Bot 共享，下一轮对话就能用上。你也可以自己补充或删掉。'));
+  if (canAdmin()) {
+    const input = h('input', { placeholder: '比如：我习惯早上 7 点起床', maxlength: 500, 'aria-label': '新的一条' });
+    const form = h('form', { class: 'fact-add' }, input, h('button', { class: 'btn go', type: 'submit' }, '记下'));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!input.value.trim()) return;
+      try { await api('POST', '/api/memory', { text: input.value }); input.value = ''; await openAbout(); } catch (ex) { toast(ex.message); }
+    });
+    page.append(form);
   }
-  if (S.unknown.length) {
-    box.append(h('h3', {}, `需要核对 · ${S.unknown.length}`));
-    for (const a of S.unknown) {
-      let input = {};
-      try { input = JSON.parse(a.input); } catch {}
-      box.append(h('article', { class: 'ticket check' },
-        h('div', { class: 'top' },
-          h('div', { class: 'label' }, '需要核对'),
-          h('div', { class: 'q' }, `${botName(a.bot_id)} 执行 `, h('b', {}, a.tool), ' 时被打断了，它可能已经生效。实际发生了吗？'),
-          h('pre', {}, brief(input))),
-        h('div', { class: 'tear' }),
-        h('div', { class: 'bottom' },
-          h('span', { class: 'left' }, a.id),
-          h('button', { class: 'btn', onclick: () => reconcile(a.id, 'not_happened') }, '没有发生'),
-          h('button', { class: 'btn go', onclick: () => reconcile(a.id, 'happened') }, '已经发生'))));
-    }
+  if (!S.globals.length) page.append(h('div', { class: 'empty' }, '还没有。和任何一个 Bot 聊聊你自己，它会记下来。'));
+  const list = h('ol', { class: 'facts' });
+  for (const m of [...S.globals].reverse()) {
+    list.append(h('li', { class: 'fact' },
+      h('div', { class: 'fact-text' }, m.text),
+      h('div', { class: 'fact-meta' },
+        m.sourceBot ? seal(m.sourceBot, 18) : null,
+        `${m.sourceBot ? `${m.sourceBot} 记下` : '你自己加的'} · ${timeLabel(m.updatedAt)}`,
+        canAdmin() ? h('button', { class: 'link', onclick: async () => {
+          if (!confirm('删掉这一条？')) return;
+          try { await api('DELETE', `/api/memory/${m.id}`); await openAbout(); } catch (e) { toast(e.message); }
+        } }, '删除') : null)));
   }
-  if (!S.approvals.length && !S.unknown.length) box.append(h('div', { class: 'welcome' }, h('h2', {}, '都处理完了'), h('p', {}, '有 Bot 需要你批准或核对时，会出现在这里。')));
-  $main.replaceChildren(head, box);
+  page.append(list);
+  $main.replaceChildren(head, page);
 }
 
 // ---------- 弹窗 ----------
 function editBotDialog(bot) {
   const name = h('input', { required: true, maxlength: 31, placeholder: '比如 股票研究', value: bot?.name ?? '', disabled: !!bot });
-  const persona = h('textarea', { placeholder: '它是谁、负责什么、说话风格。比如：你负责每天早上整理美股盘前要闻，结论先行，不超过 5 条。' }, bot?.persona ?? '');
+  const persona = h('textarea', { placeholder: '它是谁、负责什么、说话风格，以及你的红线。比如：你负责每天早上整理美股盘前要闻，结论先行，不超过 5 条；花钱之前先问我。' }, bot?.persona ?? '');
   const model = h('select', {},
     h('option', { value: '' }, '跟随账号默认'), h('option', { value: 'opus' }, 'Opus（最强）'),
     h('option', { value: 'sonnet' }, 'Sonnet（均衡）'), h('option', { value: 'haiku' }, 'Haiku（最快）'));
@@ -515,7 +617,7 @@ function editBotDialog(bot) {
     h('h2', {}, bot ? `编辑 ${bot.name}` : '新建 Bot'),
     bot ? null : preview,
     h('label', {}, '名字', h('small', {}, '不能有空格，创建后不能改'), name),
-    h('label', {}, '人设', persona),
+    h('label', {}, '人设', bot ? h('small', {}, '保存后下一轮生效') : null, persona),
     h('label', {}, '模型', model),
     err,
     h('div', { class: 'row-btns' },
@@ -526,9 +628,9 @@ function editBotDialog(bot) {
     err.textContent = '';
     try {
       if (bot) {
-        await api('PATCH', `/api/bots/${encodeURIComponent(bot.name)}`, { persona: persona.value, model: model.value });
+        await api('PATCH', `/api/bots/${enc(bot.name)}`, { persona: persona.value, model: model.value });
         $dlg.close();
-        toast('已保存');
+        toast('已保存，下一轮生效');
         await refreshState();
       } else {
         const r = await api('POST', '/api/bots', { name: name.value.trim(), persona: persona.value, model: model.value });
@@ -546,14 +648,16 @@ function editBotDialog(bot) {
 
 function botMenu(bot) {
   const pinned = S.pins.includes(bot.id);
-  const canAdmin = S.device.scopes?.includes('admin');
-  const item = (label, fn) => h('button', { type: 'button', class: 'btn', onclick: () => { $dlg.close(); fn(); } }, label);
+  const item = (label, fn, cls = 'btn') => h('button', { type: 'button', class: cls, onclick: () => { $dlg.close(); fn(); } }, label);
   $dlg.replaceChildren(h('div', { class: 'form' },
     h('div', { class: 'preview' }, seal(bot.name, 44, 'idle'), h('div', {}, h('strong', {}, bot.name), h('br'), bot.model ?? '跟随账号默认模型')),
     bot.persona ? h('p', {}, bot.persona) : null,
+    h('div', { class: 'menu-item' },
+      h('div', {}, h('strong', {}, '开新会话'), h('p', {}, '清空对话上下文，人设和记忆都保留。对话太长、或者要换个话题时用。')),
+      item('开新会话', () => newSession(bot))),
     h('div', { class: 'row-btns' },
       item(pinned ? '取消置顶' : '置顶', () => togglePin(bot)),
-      canAdmin ? item('编辑人设', () => editBotDialog(bot)) : null,
+      canAdmin() ? item('编辑人设', () => editBotDialog(bot)) : null,
       h('button', { type: 'button', class: 'btn go', onclick: () => $dlg.close() }, '关闭'))));
   $dlg.showModal();
 }
@@ -590,14 +694,6 @@ async function showRevoked(msg) {
   setConn('off');
   renderPair(`这台设备已失效（${msg}），需要重新配对。`);
 }
-
-// 审批卡底部的倒计时线：按真实剩余时间缩短
-setInterval(() => {
-  for (const i of document.querySelectorAll('.fuse')) {
-    const start = Number(i.dataset.start), end = Number(i.dataset.end);
-    i.style.transform = `scaleX(${Math.max(0, Math.min(1, (end - Date.now()) / (end - start)))})`;
-  }
-}, 1000);
 
 // ---------- 启动 ----------
 async function start() {

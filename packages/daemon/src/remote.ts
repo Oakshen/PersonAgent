@@ -1,16 +1,16 @@
-// 远程入口（手机 / 浏览器）：静态 Web 控制台 + /api。只做"看、聊、审批、打断、核对"，管理操作留在本机 CLI。
+// 远程入口（手机 / 浏览器）：静态 Web 控制台 + /api。看、聊、打断、新会话、管理记忆；插件等管理操作留在本机 CLI。
 // 默认只发布到宿主 127.0.0.1，经 tailscale serve 提供 HTTPS 给手机。
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import type { Store } from './store.ts';
 import type { Runner } from './runner.ts';
-import type { Approvals } from './approvals.ts';
-import { type Devices, DeviceError, type Scope } from './devices.ts';
-import { readBody, send } from './hooks.ts';
+import type { Devices, Scope } from './devices.ts';
+import { readBody, send } from './http.ts';
 import {
-  ServiceError, botByName, botHistory, createBot, decideApproval, reconcileAction, sendMessage, snapshot, streamEvents,
+  ServiceError, agentMemory, botByName, botHistory, createBot, editAgentMemory, newSession, sendMessage, snapshot, streamEvents,
 } from './service.ts';
+import { forgetGlobal, listGlobal, rememberGlobal } from './memory.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -27,7 +27,7 @@ type Handler = (m: RegExpMatchArray, body: any, ctx: { url: URL; res: http.Serve
 
 const STREAMING = Symbol('streaming');
 
-export function startRemote(store: Store, runner: Runner, approvals: Approvals, devices: Devices, webDir: string, port: number): http.Server {
+export function startRemote(store: Store, runner: Runner, devices: Devices, webDir: string, port: number): http.Server {
   // 每个设备当前打开的事件流，撤销时全部断开
   const streams = new Map<string, Set<() => void>>();
   devices.onRevoke((id) => {
@@ -50,7 +50,7 @@ export function startRemote(store: Store, runner: Runner, approvals: Approvals, 
     ['GET', /^\/api\/state$/, () => snapshot(store)],
     ['POST', /^\/api\/bots$/, (_m, b, { auth }) => {
       need(auth, 'admin');
-      // 远程只能设名字、人设、模型；策略和插件只能在服务器 CLI 上改
+      // 远程只能设名字、人设、模型；插件只能在服务器 CLI 上改
       const bot = createBot(store, { name: b?.name, persona: b?.persona, model: b?.model });
       return { id: bot.id, name: bot.name };
     }],
@@ -71,13 +71,28 @@ export function startRemote(store: Store, runner: Runner, approvals: Approvals, 
       need(auth, 'chat');
       return { ok: runner.interrupt(m[1], `设备 ${auth.name} 中断`) };
     }],
-    ['POST', /^\/api\/approvals\/([^/]+)$/, (m, b, { auth }) => {
-      need(auth, 'approve');
-      return decideApproval(approvals, m[1], b?.decision, `device:${auth.name}`);
+    ['POST', /^\/api\/bots\/([^/]+)\/session$/, (m, _b, { auth }) => {
+      need(auth, 'chat');
+      return newSession(store, runner, m[1], auth.name);
     }],
-    ['POST', /^\/api\/actions\/([^/]+)\/resolve$/, (m, b, { auth }) => {
-      need(auth, 'approve');
-      return reconcileAction(store, m[1], b?.outcome, `device:${auth.name}`, typeof b?.note === 'string' ? b.note.slice(0, 200) : undefined);
+    ['GET', /^\/api\/bots\/([^/]+)\/memory$/, (m) => agentMemory(store, m[1])],
+    ['PUT', /^\/api\/bots\/([^/]+)\/memory\/([^/]+)$/, (m, b, { auth }) => {
+      need(auth, 'admin');
+      return editAgentMemory(store, m[1], m[2], String(b?.content ?? ''), auth.name);
+    }],
+    ['DELETE', /^\/api\/bots\/([^/]+)\/memory\/([^/]+)$/, (m, _b, { auth }) => {
+      need(auth, 'admin');
+      return editAgentMemory(store, m[1], m[2], null, auth.name);
+    }],
+    ['GET', /^\/api\/memory$/, () => listGlobal(store)],
+    ['POST', /^\/api\/memory$/, (_m, b, { auth }) => {
+      need(auth, 'admin');
+      return rememberGlobal(store, b?.text, { by: '用户' }, b?.replaces);
+    }],
+    ['DELETE', /^\/api\/memory\/([^/]+)$/, (m, _b, { auth }) => {
+      need(auth, 'admin');
+      forgetGlobal(store, m[1], '用户');
+      return { ok: true };
     }],
     ['GET', /^\/api\/events$/, (_m, _b, { url, res, auth }) => {
       const close = streamEvents(store, res, Number(url.searchParams.get('after') ?? 0));
@@ -99,8 +114,8 @@ export function startRemote(store: Store, runner: Runner, approvals: Approvals, 
       const origin = req.headers.origin;
       if (origin && new URL(origin).host !== req.headers.host) throw new ServiceError(403, '跨站请求被拒绝');
       const body = async () => {
-        if (req.method !== 'POST' && req.method !== 'PATCH') return undefined;
-        const raw = await readBody(req, 64 * 1024);
+        if (req.method !== 'POST' && req.method !== 'PATCH' && req.method !== 'PUT') return undefined;
+        const raw = await readBody(req, 256 * 1024);
         return raw ? JSON.parse(raw) : undefined;
       };
       for (const [method, re, fn] of open) {
@@ -118,7 +133,7 @@ export function startRemote(store: Store, runner: Runner, approvals: Approvals, 
       }
       send(res, 404, { error: 'not found' });
     } catch (e) {
-      const code = e instanceof ServiceError || e instanceof DeviceError ? e.status : e instanceof SyntaxError ? 400 : 500;
+      const code = typeof (e as any)?.status === 'number' ? (e as any).status : e instanceof SyntaxError ? 400 : 500;
       if (code === 500) console.error(e);
       if (!res.headersSent) send(res, code, { error: (e as Error).message });
     }

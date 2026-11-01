@@ -16,7 +16,7 @@ async function docker(args: string[]): Promise<string> {
 export const containerName = (botId: string) => `pagent-${botId.replace('_', '-')}`;
 
 // worker 容器的规格版本：挂载、环境变量等变了就加一，旧容器会被自动重建（状态都在挂载目录里，容器可丢弃）
-const WORKER_SPEC = '2';
+const WORKER_SPEC = '4';
 
 /** 按容器名写出口白名单；egress 代理会定时重读这个文件。原子替换，避免读到半个文件。 */
 export function allowEgress(name: string, targets: string[]): void {
@@ -53,15 +53,16 @@ export async function ensureWorker(botId: string): Promise<string> {
     '-v', `${base}/work:/work`,
     '-v', `${config.assetsDir}:/opt/pagent:ro`,
     '-v', `${join(config.dataDir, 'plugins')}:/opt/pagent-plugins:ro`,
-    // 策略 hook 放在 managed settings：只读、优先级最高，agent 改不了自己的配置来关掉它
-    '-v', `${config.assetsDir}/managed-settings.json:/etc/claude-code/managed-settings.json:ro`,
     ...(config.hostCred ? ['-v', `${config.hostCred}:/home/agent/.claude/.credentials.json`] : []),
     '-e', 'HOME=/home/agent',
     '-e', 'CLAUDE_CONFIG_DIR=/home/agent/.claude',
-    '-e', 'HTTPS_PROXY=http://egress:3128',
-    '-e', 'HTTP_PROXY=http://egress:3128',
-    '-e', `NO_PROXY=${config.hookHost},.plugin`,   // MCP 插件走内网直连，不经出口代理
+    // 大小写都设：curl 等工具只认小写的 http_proxy
+    ...['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'].flatMap((k) => ['-e', `${k}=http://egress:3128`]),
+    // pagent MCP 和插件走内网直连，不经出口代理
+    ...['NO_PROXY', 'no_proxy'].flatMap((k) => ['-e', `${k}=${config.mcpHost},.plugin`]),
     '-e', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1',
+    // 记忆由 pagent 管（两层记忆注入系统提示），关掉 Claude Code 自带的 auto-memory，免得两套并存
+    '-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=1',
     '--label', `pagent.bot=${botId}`,
     '--label', `pagent.spec=${WORKER_SPEC}`,
     '-w', '/work',

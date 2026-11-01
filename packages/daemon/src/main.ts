@@ -2,23 +2,21 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.ts';
 import { Store } from './store.ts';
-import { Approvals } from './approvals.ts';
 import { Runner } from './runner.ts';
-import { startHookServer } from './hooks.ts';
+import { startMcpServer } from './mcp.ts';
 import { startApi } from './api.ts';
 import { Devices } from './devices.ts';
 import { startRemote } from './remote.ts';
 
 mkdirSync(config.dataDir, { recursive: true });
 const store = new Store(join(config.dataDir, 'pagent.db'));
-const approvals = new Approvals(store, config.approvalTtlSec);
-const runner = new Runner(store, approvals);
+const runner = new Runner(store);
 const devices = new Devices(store);
 
 runner.recover();
-const hookServer = startHookServer(store, approvals, config.hookPort);
-const api = startApi(store, runner, approvals, devices, config.sock);
-const remote = startRemote(store, runner, approvals, devices, config.webDir, config.remotePort);
+const mcp = startMcpServer(store, runner, config.mcpPort);
+const api = startApi(store, runner, devices, config.sock);
+const remote = startRemote(store, runner, devices, config.webDir, config.remotePort);
 
 let stopping = false;
 function shutdown(sig: string) {
@@ -29,7 +27,7 @@ function shutdown(sig: string) {
   for (const id of active) runner.interrupt(id);
   api.close();
   remote.close();
-  hookServer.close();
+  mcp.close();
   setTimeout(() => process.exit(0), active.length ? 3000 : 0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));

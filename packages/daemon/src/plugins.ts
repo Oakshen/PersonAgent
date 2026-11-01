@@ -8,7 +8,6 @@ import { ensurePluginContainer, pluginHost } from './docker.ts';
 import {
   type PluginManifest, canonicalPermissions, mcpServerName, validateManifest,
 } from '../../protocol/src/plugin.ts';
-import type { PolicyRule } from '../../protocol/src/types.ts';
 
 export interface PluginRow { id: string; version: string; manifest: string; dir: string; hash: string; installed_at: string }
 export interface BotPluginRow { bot_id: string; plugin_id: string; granted: string; enabled_at: string }
@@ -109,19 +108,9 @@ function enabledFor(store: Store, botId: string): { ok: Enabled[]; stale: string
   return { ok, stale };
 }
 
-/** Hook 判定用：插件 actions 建议的审批级别（用户启用时已同意），排在 Bot 自定义规则之后、默认规则之前 */
-export function pluginRules(store: Store, botId: string): PolicyRule[] {
-  return enabledFor(store, botId).ok.flatMap(({ manifest }) =>
-    Object.entries(manifest.permissions.actions ?? {}).map(([tool, decision]) => ({
-      tool: `mcp__${mcpServerName(manifest.id)}__${tool}`,
-      decision,
-      reason: `插件 ${manifest.id} 的 ${tool}（启用时已同意：${decision}）`,
-    })));
-}
+export interface RunPlugins { servers: Record<string, unknown>; pluginDirs: string[]; stale: string[] }
 
-export interface RunPlugins { mcpConfig: string; pluginDirs: string[]; stale: string[] }
-
-/** 每轮开跑前：拉起 MCP 插件容器，组装 --mcp-config 和 --plugin-dir */
+/** 每轮开跑前：拉起 MCP 插件容器，组装 --mcp-config 里的插件部分和 --plugin-dir */
 export async function prepareRun(store: Store, botId: string): Promise<RunPlugins> {
   const { ok, stale } = enabledFor(store, botId);
   const servers: Record<string, unknown> = {};
@@ -135,5 +124,5 @@ export async function prepareRun(store: Store, botId: string): Promise<RunPlugin
       servers[mcpServerName(manifest.id)] = { type: 'http', url: `http://${pluginHost(manifest.id)}:${mcp.port ?? 8080}${mcp.path ?? '/mcp'}` };
     }
   }
-  return { mcpConfig: JSON.stringify({ mcpServers: servers }), pluginDirs, stale };
+  return { servers, pluginDirs, stale };
 }

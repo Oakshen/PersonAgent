@@ -3,9 +3,9 @@
 import { createHash, createPublicKey, randomBytes, verify, type JsonWebKey } from 'node:crypto';
 import { type Store, newId, now } from './store.ts';
 
-// chat：发消息 / 打断；approve：审批 / 核对；admin：创建和修改 Bot（策略、插件仍只能在服务器 CLI 上改）
-export type Scope = 'chat' | 'approve' | 'admin';
-export const ALL_SCOPES: Scope[] = ['chat', 'approve', 'admin'];
+// chat：发消息、打断、开新会话；admin：创建和修改 Bot、编辑记忆（插件仍只能在服务器 CLI 上改）
+export type Scope = 'chat' | 'admin';
+export const ALL_SCOPES: Scope[] = ['chat', 'admin'];
 
 export interface DeviceRow {
   id: string; name: string; public_key: string; scopes: string; created_at: string;

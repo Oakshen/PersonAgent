@@ -3,9 +3,15 @@
   "version": "1.0.0",
   "name": "网页抓取",
   "description": "示例 MCP 插件：抓取声明过的站点。没有依赖，安装时不执行任何脚本。",
-  "contributes": { "mcp": { "runtime": "node", "entry": "server.mjs" } },
+  "contributes": {
+    "mcp": {
+      "runtime": "node",
+      "entry": "server.mjs"
+    }
+  },
   "permissions": {
-    "network": ["api.github.com:443"],
-    "actions": { "fetch": "ask", "allowed_hosts": "allow" }
+    "network": [
+      "api.github.com:443"
+    ]
   }
 }

@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS bots (
 );
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY, bot_id TEXT NOT NULL REFERENCES bots(id), session_id TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL, archived_at TEXT, mem_base TEXT, mem_delivered TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL REFERENCES threads(id),
@@ -35,10 +35,14 @@ CREATE TABLE IF NOT EXISTS actions (
   tool TEXT NOT NULL, input TEXT NOT NULL, side_effect INTEGER NOT NULL,
   status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS approvals (
-  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), action_id TEXT NOT NULL REFERENCES actions(id),
-  tool TEXT NOT NULL, input_hash TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL,
-  expires_at TEXT NOT NULL, decided_by TEXT, decided_at TEXT, created_at TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY, text TEXT NOT NULL, source_bot_id TEXT, source_run_id TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS asks (
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), bot_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+  question TEXT NOT NULL, options TEXT NOT NULL, allow_custom INTEGER NOT NULL,
+  answer TEXT, created_at TEXT NOT NULL, answered_at TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, bot_id TEXT, thread_id TEXT, run_id TEXT,
@@ -90,6 +94,9 @@ export class Store {
       ['bots', 'daily_turn_budget', 'INTEGER NOT NULL DEFAULT 300'],
       ['bots', 'max_run_seconds', 'INTEGER NOT NULL DEFAULT 1800'],
       ['bots', 'max_actions', 'INTEGER NOT NULL DEFAULT 100'],
+      ['threads', 'archived_at', 'TEXT'],
+      ['threads', 'mem_base', 'TEXT'],
+      ['threads', 'mem_delivered', 'TEXT'],
     ];
     for (const [table, col, def] of add) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
@@ -163,11 +170,17 @@ export interface BotRow {
   id: string; name: string; persona: string; model: string | null; policy: string; max_turns: number; created_at: string;
   daily_turn_budget: number; max_run_seconds: number; max_actions: number;
 }
-export interface ThreadRow { id: string; bot_id: string; session_id: string | null; created_at: string }
+// mem_base：会话第一轮写进系统提示的人设和记忆（会话期间不会再变）；mem_delivered：在此基础上又补发过的更新。都是 MemSnap JSON
+export interface ThreadRow {
+  id: string; bot_id: string; session_id: string | null; created_at: string; archived_at: string | null;
+  mem_base: string | null; mem_delivered: string | null;
+}
 export interface RunRow {
+  // hook_token：沿用旧列名，现在是这一轮访问 pagent MCP 的凭据
   id: string; thread_id: string; bot_id: string; status: string; hook_token: string; interrupt_requested: number;
   num_turns: number | null; cost_usd: number | null; usage: string | null; result: string | null; error: string | null;
   started_at: string; ended_at: string | null;
 }
 export interface ActionRow { id: string; run_id: string; tool_use_id: string | null; tool: string; input: string; side_effect: number; status: string; reason: string | null; created_at: string; updated_at: string }
-export interface ApprovalRow { id: string; run_id: string; action_id: string; tool: string; input_hash: string; summary: string; status: string; expires_at: string; decided_by: string | null; decided_at: string | null; created_at: string }
+export interface MemoryRow { id: string; text: string; source_bot_id: string | null; source_run_id: string | null; created_at: string; updated_at: string; deleted_at: string | null }
+export interface AskRow { id: string; run_id: string; bot_id: string; thread_id: string; question: string; options: string; allow_custom: number; answer: string | null; created_at: string; answered_at: string | null }

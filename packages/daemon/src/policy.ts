@@ -3,14 +3,14 @@ import type { Decision, PolicyRule } from '../../protocol/src/types.ts';
 
 export const DEFAULT_RULES: PolicyRule[] = [
   { tool: 'Bash', field: 'run_in_background', match: 'true', decision: 'deny', reason: '后台任务不受中断控制，已禁用；请在前台运行' },
-  { tool: 'Read|Glob|Grep|LS|ToolSearch|TodoWrite|TaskOutput|NotebookRead', decision: 'allow' },
+  { tool: 'Read|Glob|Grep|LS|ToolSearch|TodoWrite|TaskOutput|NotebookRead|Skill', decision: 'allow' },
   { tool: 'Write|Edit|MultiEdit|NotebookEdit', field: 'file_path', match: '/work/.*', decision: 'allow' },
   { tool: 'Write|Edit|MultiEdit|NotebookEdit', decision: 'deny', reason: '只允许写入 /work' },
   { tool: '.*', decision: 'ask' },
 ];
 
 // 不产生外部副作用的工具：执行中断时不会进入 unknown
-const READ_ONLY = /^(Read|Glob|Grep|LS|ToolSearch|TodoWrite|TaskOutput|NotebookRead|WebSearch)$/;
+const READ_ONLY = /^(Read|Glob|Grep|LS|ToolSearch|TodoWrite|TaskOutput|NotebookRead|WebSearch|Skill)$/;
 export const hasSideEffect = (tool: string) => !READ_ONLY.test(tool);
 
 export interface Verdict { decision: Decision; reason: string; rule: PolicyRule }

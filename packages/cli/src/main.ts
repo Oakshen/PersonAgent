@@ -4,6 +4,8 @@ import http from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import type { Bot, PagentEvent } from '../../protocol/src/types.ts';
 
 const SOCK = process.env.PAGENT_SOCK ?? join(homedir(), 'pagent/run/api.sock');
@@ -117,6 +119,49 @@ function flag(args: string[], name: string): string | undefined {
   return v;
 }
 
+/** 把插件目录打包成 {相对路径: base64}；不跟随符号链接 */
+function packDir(dir: string): Record<string, string> {
+  const root = resolve(dir);
+  const files: Record<string, string> = {};
+  let total = 0;
+  const walk = (d: string) => {
+    for (const name of readdirSync(d)) {
+      if (name === '.git') continue;
+      const p = `${d}/${name}`;
+      const st = lstatSync(p);
+      if (st.isSymbolicLink()) throw new Error(`插件里不能有符号链接：${relative(root, p)}`);
+      if (st.isDirectory()) walk(p);
+      else {
+        total += st.size;
+        if (total > 15 * 1024 * 1024) throw new Error('插件超过 15MB');
+        files[relative(root, p)] = readFileSync(p).toString('base64');
+      }
+    }
+  };
+  walk(root);
+  return files;
+}
+
+async function confirm(q: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const a = (await rl.question(q)).trim().toLowerCase();
+  rl.close();
+  return a === 'y';
+}
+
+function describePermissions(m: any): string {
+  const p = m.permissions ?? {};
+  const lines = [];
+  if (m.contributes?.skills?.length) lines.push(`  提供 Skill：${m.contributes.skills.join(', ')}`);
+  if (m.contributes?.mcp) lines.push(`  提供工具（MCP，运行在独立沙箱）`);
+  lines.push(`  出网：${p.network?.length ? p.network.join(', ') : '无'}`);
+  for (const [t, d] of Object.entries(p.actions ?? {})) {
+    lines.push(`  工具 ${t}：${d === 'allow' ? yellow('自动放行') : d === 'deny' ? '禁止' : '每次审批'}`);
+  }
+  return lines.join('\n');
+}
+
 const USAGE = `用法：
   pagent bot create <name> [--persona 文本] [--model 模型] [--max-turns N]
   pagent bot ls | pagent bot show <name>
@@ -124,7 +169,9 @@ const USAGE = `用法：
   pagent chat <bot> [--new] <消息…>
   pagent approvals | pagent approve <id> | pagent deny <id>
   pagent runs [bot] | pagent run <runId> | pagent interrupt <runId>
-  pagent events [--after N] [-f]`;
+  pagent events [--after N] [-f]
+  pagent plugin install <目录> | pagent plugin ls | pagent plugin show <id>
+  pagent plugin enable <bot> <id> [--yes] | pagent plugin disable <bot> <id> | pagent plugin bot <bot>`;
 
 async function main(argv: string[]) {
   const [cmd, ...args] = argv;
@@ -165,6 +212,26 @@ async function main(argv: string[]) {
     }
     case 'interrupt':
       return console.log((await call('POST', `/runs/${args[0]}/interrupt`)).ok ? '已发出中断' : '该 run 不在运行中');
+    case 'plugin': {
+      const [sub, a1, a2] = args;
+      if (sub === 'install') {
+        const p = await call('POST', '/plugins', { files: packDir(a1) });
+        console.log(`已安装 ${p.id}@${p.version}（sha256 ${p.hash.slice(0, 12)}…）\n${describePermissions(p.manifest)}`);
+        return;
+      }
+      if (sub === 'ls') return table((await call('GET', '/plugins')).map((p: any) => ({ ...p, hash: p.hash.slice(0, 12) })), ['id', 'version', 'hash', 'installedAt']);
+      if (sub === 'show') return console.log(JSON.stringify(await call('GET', `/plugins/${a1}`), null, 2));
+      if (sub === 'bot') return table(await call('GET', `/bots/${a1}/plugins`), ['id', 'version', 'status', 'enabledAt']);
+      if (sub === 'disable') return console.log((await call('DELETE', `/bots/${a1}/plugins/${a2}`)).ok ? '已停用' : '本来就没启用');
+      if (sub === 'enable') {
+        const p = await call('GET', `/plugins/${a2}`);
+        console.log(`给 ${a1} 启用 ${p.id}@${p.version}，它会获得以下权限：\n${describePermissions(p.manifest)}`);
+        if (!args.includes('--yes') && !(await confirm('同意并启用？[y/N] '))) return console.log('已取消');
+        await call('POST', `/bots/${a1}/plugins`, { id: a2 });
+        return console.log('已启用');
+      }
+      break;
+    }
     case 'events': {
       const after = flag(args, '--after') ?? '0';
       if (!args.includes('-f')) {

@@ -45,4 +45,5 @@ export type EventType =
   | 'action.decided'
   | 'action.completed'
   | 'approval.requested'
-  | 'approval.resolved';
+  | 'approval.resolved'
+  | 'plugin.needs_consent';

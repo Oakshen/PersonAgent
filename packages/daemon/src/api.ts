@@ -1,7 +1,12 @@
 // 本机管理 API：只监听 unix socket（0600），worker 所在的网络够不到它。
 // 手机 / 远程设备的入口在 P2 单独做（设备认证）。
 import http from 'node:http';
-import { chmodSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, normalize } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { config } from './config.ts';
+import { type BotPluginRow, type PluginRow, PluginError, disable, enable, install } from './plugins.ts';
+import { canonicalPermissions } from '../../protocol/src/plugin.ts';
 import { type ActionRow, type ApprovalRow, type BotRow, type RunRow, type Store, type ThreadRow, bus, newId, now } from './store.ts';
 import { readBody, send } from './hooks.ts';
 import type { Runner } from './runner.ts';
@@ -88,6 +93,48 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
       if (!r.ok) throw new HttpError(409, `审批已是 ${r.current} 状态，不能再改`);
       return { ok: true, status };
     }],
+    ['GET', /^\/plugins$/, () => store.all<PluginRow>('SELECT * FROM plugins ORDER BY id').map(toPlugin)],
+    ['GET', /^\/plugins\/([^/]+)$/, (m) => {
+      const p = store.get<PluginRow>('SELECT * FROM plugins WHERE id = ?', m[1]);
+      if (!p) throw new HttpError(404, `插件 ${m[1]} 未安装`);
+      return toPlugin(p);
+    }],
+    // 安装：CLI 把插件目录打包成 {相对路径: base64} 上传，这里落到暂存目录再走校验安装
+    ['POST', /^\/plugins$/, (_m, b) => {
+      const files = b?.files as Record<string, string> | undefined;
+      if (!files || typeof files !== 'object') throw new HttpError(400, '缺少 files');
+      const stage = join(config.dataDir, 'plugins', '.staging', randomBytes(6).toString('hex'));
+      try {
+        for (const [rel, b64] of Object.entries(files)) {
+          const n = normalize(rel);
+          if (n.startsWith('..') || n.startsWith('/') || n.includes('\0')) throw new HttpError(400, `非法路径：${rel}`);
+          mkdirSync(dirname(join(stage, n)), { recursive: true });
+          writeFileSync(join(stage, n), Buffer.from(b64, 'base64'), { mode: 0o644 });
+        }
+        return toPlugin(install(store, stage));
+      } catch (e) {
+        if (e instanceof PluginError) throw new HttpError(400, e.message);
+        throw e;
+      } finally {
+        rmSync(stage, { recursive: true, force: true });
+      }
+    }],
+    ['GET', /^\/bots\/([^/]+)\/plugins$/, (m) => {
+      const bot = botByName(m[1]);
+      return store.all<BotPluginRow & { manifest: string; version: string }>(
+        'SELECT bp.*, p.manifest, p.version FROM bot_plugins bp JOIN plugins p ON p.id = bp.plugin_id WHERE bp.bot_id = ?', bot.id)
+        .map((r) => ({
+          id: r.plugin_id, version: r.version, enabledAt: r.enabled_at,
+          status: canonicalPermissions(JSON.parse(r.manifest).permissions) === r.granted ? 'active' : 'needs_consent',
+        }));
+    }],
+    ['POST', /^\/bots\/([^/]+)\/plugins$/, (m, b) => {
+      try { return enable(store, botByName(m[1]).id, b?.id); } catch (e) {
+        if (e instanceof PluginError) throw new HttpError(404, e.message);
+        throw e;
+      }
+    }],
+    ['DELETE', /^\/bots\/([^/]+)\/plugins\/([^/]+)$/, (m) => ({ ok: disable(store, botByName(m[1]).id, m[2]) })],
     ['GET', /^\/events$/, (_m, _b, url, res) => streamEvents(store, url, res)],
   ];
 
@@ -97,7 +144,7 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
       for (const [method, re, fn] of routes) {
         const m = url.pathname.match(re);
         if (!m || method !== req.method) continue;
-        const raw = req.method === 'GET' ? '' : await readBody(req);
+        const raw = req.method === 'GET' || req.method === 'DELETE' ? '' : await readBody(req, 20 * 1024 * 1024);
         const out = fn(m, raw ? JSON.parse(raw) : undefined, url, res);
         if (out !== STREAMING) send(res, 200, out);
         return;
@@ -118,6 +165,8 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
 }
 
 const STREAMING = Symbol('streaming');
+
+const toPlugin = (p: PluginRow) => ({ id: p.id, version: p.version, hash: p.hash, installedAt: p.installed_at, manifest: JSON.parse(p.manifest) });
 
 /** 事件流：after 游标续传；follow=1 时以 SSE 持续推送。客户端断线重连带上最后的 seq 即可不重不漏。 */
 function streamEvents(store: Store, url: URL, res: http.ServerResponse): unknown {

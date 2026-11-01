@@ -44,6 +44,14 @@ CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, bot_id TEXT, thread_id TEXT, run_id TEXT,
   type TEXT NOT NULL, data TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plugins (
+  id TEXT PRIMARY KEY, version TEXT NOT NULL, manifest TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL,
+  installed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bot_plugins (
+  bot_id TEXT NOT NULL REFERENCES bots(id), plugin_id TEXT NOT NULL REFERENCES plugins(id),
+  granted TEXT NOT NULL, enabled_at TEXT NOT NULL, PRIMARY KEY (bot_id, plugin_id)
+);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, status);
 CREATE INDEX IF NOT EXISTS idx_runs_thread ON runs(thread_id, status);
 CREATE INDEX IF NOT EXISTS idx_actions_run ON actions(run_id, tool_use_id);

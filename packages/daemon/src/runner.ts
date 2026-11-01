@@ -6,6 +6,7 @@ import { type BotRow, type RunRow, type Store, type ThreadRow, newId, now } from
 import { ensureWorker, execTurn, interruptTurn } from './docker.ts';
 import { config } from './config.ts';
 import type { Approvals } from './approvals.ts';
+import { prepareRun } from './plugins.ts';
 import type { RunStatus } from '../../protocol/src/types.ts';
 
 interface Active { runId: string; container?: string; cancelKill?: () => void }
@@ -68,11 +69,15 @@ export class Runner {
     const ref = { botId: bot.id, threadId, runId };
 
     let container: string;
+    let plugins: Awaited<ReturnType<typeof prepareRun>>;
     try {
-      container = await ensureWorker(bot.id);
+      [container, plugins] = await Promise.all([ensureWorker(bot.id), prepareRun(this.store, bot.id)]);
     } catch (e) {
-      this.finish(ref, null, `启动 worker 失败：${(e as Error).message}`);
+      this.finish(ref, null, `启动 worker / 插件失败：${(e as Error).message}`);
       return;
+    }
+    if (plugins.stale.length) {
+      this.store.emit('plugin.needs_consent', { plugins: plugins.stale, note: '插件权限已变化，需重新启用后才会加载' }, ref);
     }
     entry.container = container;
     if (this.store.get<RunRow>('SELECT * FROM runs WHERE id = ?', runId)!.interrupt_requested) {
@@ -81,7 +86,9 @@ export class Runner {
     }
 
     const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'default',
-      '--strict-mcp-config', '--setting-sources', 'user', '--max-turns', String(bot.max_turns)];
+      '--strict-mcp-config', '--mcp-config', plugins.mcpConfig,
+      '--setting-sources', 'user', '--max-turns', String(bot.max_turns)];
+    for (const d of plugins.pluginDirs) args.push('--plugin-dir', d);
     if (bot.model) args.push('--model', bot.model);
     if (bot.persona) args.push('--append-system-prompt', bot.persona);
     if (thread.session_id) args.push('--resume', thread.session_id);

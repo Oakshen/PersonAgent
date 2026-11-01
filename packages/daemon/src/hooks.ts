@@ -4,6 +4,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { type ActionRow, type BotRow, type RunRow, type Store, newId, now } from './store.ts';
 import { evaluate, hasSideEffect, summarize } from './policy.ts';
 import type { Approvals } from './approvals.ts';
+import { pluginRules } from './plugins.ts';
 import type { Decision, PolicyRule } from '../../protocol/src/types.ts';
 
 interface HookInput {
@@ -49,7 +50,8 @@ async function pre(store: Store, approvals: Approvals, run: RunRow, h: HookInput
   const ref = { runId: run.id, botId: run.bot_id, threadId: run.thread_id };
   const bot = store.get<BotRow>('SELECT * FROM bots WHERE id = ?', run.bot_id)!;
   const live = store.get<RunRow>('SELECT * FROM runs WHERE id = ?', run.id)!;
-  let { decision, reason } = evaluate(JSON.parse(bot.policy) as PolicyRule[], h.tool_name, h.tool_input ?? {});
+  const rules = [...(JSON.parse(bot.policy) as PolicyRule[]), ...pluginRules(store, bot.id)];
+  let { decision, reason } = evaluate(rules, h.tool_name, h.tool_input ?? {});
   if (live.status !== 'running' || live.interrupt_requested) {
     decision = 'deny';
     reason = '这一轮已被中断';

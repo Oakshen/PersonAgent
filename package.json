@@ -1,0 +1,14 @@
+{
+  "name": "personagent",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "node --test packages/*/test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5.9"
+  }
+}

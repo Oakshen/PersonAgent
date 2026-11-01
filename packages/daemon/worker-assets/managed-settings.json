@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "node /opt/pagent/hook.mjs pre", "timeout": 600 }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "node /opt/pagent/hook.mjs post", "timeout": 30 }] }
+    ]
+  },
+  "allowManagedHooksOnly": true
+}

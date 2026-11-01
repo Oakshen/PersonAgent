@@ -1,0 +1,50 @@
+# 单机部署：egress + pagentd。worker 容器由 pagentd 按需创建（每个 Bot 一个）。
+# 用 deploy/up.sh 启动，它会准备好下面用到的环境变量。
+name: pagent
+
+networks:
+  sandbox:
+    name: pagent_sandbox
+    internal: true          # worker 只在这里，没有直接出网的路由
+  outside:
+    name: pagent_outside
+
+services:
+  egress:
+    image: node:24-slim
+    command: node /app/proxy.mjs
+    restart: unless-stopped
+    volumes:
+      - ${PAGENT_SRC}/packages/egress:/app:ro
+      - ${PAGENT_DATA}:${PAGENT_DATA}:ro
+    environment:
+      RULES_FILE: ${PAGENT_DATA}/egress-rules.json
+    networks: [sandbox, outside]
+
+  pagentd:
+    build:
+      context: .
+      dockerfile: pagentd.Dockerfile
+    image: pagentd
+    restart: unless-stopped
+    user: "${PAGENT_UID}:${DOCKER_GID}"   # 能用 docker.sock；数据文件属主是宿主用户
+    working_dir: ${PAGENT_SRC}
+    command: node packages/daemon/src/main.ts
+    stop_grace_period: 15s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PAGENT_SRC}:${PAGENT_SRC}:ro
+      - ${PAGENT_DATA}:${PAGENT_DATA}
+      - ${PAGENT_RUN}:${PAGENT_RUN}
+    environment:
+      HOME: /tmp
+      PAGENT_DATA: ${PAGENT_DATA}
+      PAGENT_SOCK: ${PAGENT_RUN}/api.sock
+      PAGENT_ASSETS: ${PAGENT_SRC}/packages/daemon/worker-assets
+      PAGENT_EGRESS_RULES: ${PAGENT_DATA}/egress-rules.json
+      PAGENT_WORKER_USER: "${PAGENT_UID}:${PAGENT_UID}"
+      PAGENT_HOST_CRED: ${PAGENT_HOST_CRED:-}
+      PAGENT_WORKER_ALLOW: api.anthropic.com:443,platform.claude.com:443,console.anthropic.com:443,claude.ai:443
+    networks:
+      sandbox:
+        aliases: [pagentd]

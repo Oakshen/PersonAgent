@@ -1,0 +1,7 @@
+# 复用宿主已登录的订阅：共享宿主 ~/.claude/.credentials.json（与宿主上多开 claude 会话等价）
+# docker compose -f compose.yaml -f compose.hostcred.yaml up -d
+services:
+  worker:
+    user: "${HOST_UID}:${HOST_GID}"
+    volumes:
+      - ${HOST_CRED}:/home/agent/.claude/.credentials.json

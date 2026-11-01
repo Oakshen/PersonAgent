@@ -1,0 +1,58 @@
+# P0：控制面之外的三个角色。worker / plugin 只在 internal 网络，出网必须经过 egress。
+networks:
+  sandbox:
+    internal: true
+  outside: {}
+
+services:
+  egress:
+    image: node:24-slim
+    command: node /app/proxy.mjs
+    restart: unless-stopped
+    volumes: ["./egress:/app:ro"]
+    networks: [sandbox, outside]
+    environment:
+      RULES: ${EGRESS_RULES}
+      INJECT_TARGET: ${INJECT_TARGET:-}
+      INJECT_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+
+  plugin-demo:
+    build: ./plugin
+    networks: [sandbox]
+    read_only: true
+    user: "10002:10002"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      NODE_USE_ENV_PROXY: "1"
+      HTTPS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+
+  worker:
+    build:
+      context: ./worker
+      args: { CLAUDE_VERSION: "${CLAUDE_VERSION:-2.1.312}" }
+    networks: [sandbox]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2
+    tmpfs: ["/tmp"]
+    volumes:
+      - ./data/bot-a/home:/home/agent      # CLAUDE_CONFIG_DIR 在这里，每个 Bot 独立
+      - ./data/bot-a/work:/work
+      - ./probe.mjs:/opt/probe.mjs:ro
+      - ./mcp.json:/opt/mcp.json:ro
+      - ./hooks:/opt/hooks:ro
+    working_dir: /work
+    environment:
+      HOME: /home/agent
+      CLAUDE_CONFIG_DIR: /home/agent/.claude
+      HTTPS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      NO_PROXY: plugin-demo
+    init: true
+    command: sleep infinity

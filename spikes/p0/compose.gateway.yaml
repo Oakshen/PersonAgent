@@ -1,0 +1,9 @@
+# 网关模式叠加：docker compose -f compose.yaml -f compose.gateway.yaml up -d
+services:
+  egress:
+    extra_hosts: ["host.lima.internal:192.168.5.2"]
+  worker:
+    environment:
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}
+      ANTHROPIC_AUTH_TOKEN: placeholder-not-a-secret
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL}

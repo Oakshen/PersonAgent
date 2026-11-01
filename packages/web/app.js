@@ -104,6 +104,9 @@ function inline(text) {
   frag.append(text.slice(last));
   return frag;
 }
+const TABLE_SEP = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+/** 一行表格拆成单元格：去掉首尾的 |，\| 是转义的竖线 */
+const cells = (l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
 function md(text) {
   const frag = document.createDocumentFragment();
   const parts = String(text).split(/```[\w-]*\n?/);
@@ -113,8 +116,20 @@ function md(text) {
     const flush = () => {
       if (para.length) { const p = h('p'); para.forEach((l, j) => { if (j) p.append(h('br')); p.append(inline(l)); }); frag.append(p); para = []; }
     };
-    for (const raw of part.split('\n')) {
-      const line = raw.trimEnd();
+    const lines = part.split('\n');
+    for (let k = 0; k < lines.length; k++) {
+      const line = lines[k].trimEnd();
+      // 表格：| 表头 | 下一行是 |---|:---:| 分隔行
+      if (/^\s*\|.*\|\s*$/.test(line) && TABLE_SEP.test(lines[k + 1] ?? '')) {
+        flush(); list = null;
+        const align = cells(lines[k + 1]).map((c) => (/^:-+:$/.test(c) ? 'center' : /-:$/.test(c) ? 'right' : null));
+        const row = (l, tag) => h('tr', {}, ...cells(l).map((c, j) => h(tag, align[j] ? { class: `al-${align[j]}` } : {}, inline(c))));
+        const body = [];
+        for (k += 2; k < lines.length && /^\s*\|.*\|\s*$/.test(lines[k]); k++) body.push(row(lines[k], 'td'));
+        k--;
+        frag.append(h('div', { class: 'table-wrap' }, h('table', {}, h('thead', {}, row(line, 'th')), h('tbody', {}, ...body))));
+        continue;
+      }
       const ul = /^\s*[-*•]\s+(.*)$/.exec(line), ol = /^\s*\d+[.)]\s+(.*)$/.exec(line), hd = /^#{1,4}\s+(.*)$/.exec(line);
       if (ul || ol) {
         flush();

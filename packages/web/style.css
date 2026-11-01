@@ -122,6 +122,14 @@ svg { display: block; }
 .say code { font: 13px var(--mono); background: var(--soft); padding: 1px 5px; border-radius: 5px; }
 .say pre { margin: 6px 0 10px; padding: 12px 14px; background: var(--soft); border-radius: 10px; overflow-x: auto; font: 12.5px/1.6 var(--mono); }
 .say pre code { background: none; padding: 0; }
+.say .table-wrap { margin: 6px 0 10px; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+.say .table-wrap:last-child { margin-bottom: 0; }
+.say table { border-collapse: collapse; width: 100%; font-size: 13.5px; line-height: 1.5; }
+.say th, .say td { padding: 7px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+.say th { font-weight: 600; background: var(--soft); white-space: nowrap; }
+.say tbody tr:last-child td { border-bottom: 0; }
+.say .al-right { text-align: right; font-variant-numeric: tabular-nums; }
+.say .al-center { text-align: center; }
 .say a { color: inherit; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--ink-3); }
 /* 工具步骤：淡灰小胶囊 */
 .step { align-self: flex-start; max-width: 100%; display: inline-flex; align-items: center; gap: 8px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);

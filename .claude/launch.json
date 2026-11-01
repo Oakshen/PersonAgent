@@ -4,8 +4,32 @@
     {
       "name": "pagent-web",
       "runtimeExecutable": "ssh",
-      "runtimeArgs": ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L", "7780:127.0.0.1:7780", "claude-2"],
+      "runtimeArgs": [
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-L",
+        "7780:127.0.0.1:7780",
+        "claude-2"
+      ],
       "port": 7780
+    },
+    {
+      "name": "pagent-web-alt",
+      "runtimeExecutable": "ssh",
+      "runtimeArgs": [
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-L",
+        "7781:127.0.0.1:7780",
+        "claude-2"
+      ],
+      "port": 7781
     }
   ]
 }

@@ -4,8 +4,9 @@ import { createHash, createPublicKey, randomBytes, verify, type JsonWebKey } fro
 import { type Store, newId, now } from './store.ts';
 
 // chat：发消息、打断、开新会话；admin：创建和修改 Bot、编辑记忆（插件仍只能在服务器 CLI 上改）
-export type Scope = 'chat' | 'admin';
-export const ALL_SCOPES: Scope[] = ['chat', 'admin'];
+// local：本机执行守护进程（只能领任务、交结果，不能聊天）
+export type Scope = 'chat' | 'admin' | 'local';
+export const ALL_SCOPES: Scope[] = ['chat', 'admin', 'local'];
 
 export interface DeviceRow {
   id: string; name: string; public_key: string; scopes: string; created_at: string;

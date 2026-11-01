@@ -8,7 +8,7 @@ import type { PagentEvent } from '../../protocol/src/types.ts';
 
 // runner / config 在导入时读环境变量
 const data = mkdtempSync(join(tmpdir(), 'pagent-test-'));
-Object.assign(process.env, { PAGENT_DATA: data, PAGENT_SOCK: join(data, 's'), PAGENT_ASSETS: data, PAGENT_EGRESS_RULES: join(data, 'r.json'), PAGENT_WEB_DIR: data });
+Object.assign(process.env, { PAGENT_DATA: data, PAGENT_SOCK: join(data, 's'), PAGENT_HOST_SRC: data, PAGENT_EGRESS_RULES: join(data, 'r.json'), PAGENT_WEB_DIR: data });
 const { Store, bus, newId, now } = await import('../src/store.ts');
 const { Runner } = await import('../src/runner.ts');
 const mem = await import('../src/memory.ts');
@@ -102,12 +102,13 @@ test('Agent 记忆：文件名校验、读写、变化比对', () => {
 test('系统提示：人设在前，两层记忆都带上，带编号', () => {
   const { store } = fixture();
   const m = mem.rememberGlobal(store, '用户叫 Oak', { by: '用户' });
-  const sys = mem.systemPrompt('你是运维值班', mem.listGlobal(store), '- 部署在 claude-2');
+  const sys = mem.systemPrompt('你是运维值班', mem.guideFor('运维值班', '/home/box/.pagent/agents/b/claude/memory'), mem.listGlobal(store), '- 部署在 claude-2');
   assert.ok(sys.startsWith('你是运维值班'));
   assert.ok(sys.includes(`- [${m.id}] 用户叫 Oak`));
   assert.ok(sys.includes('- 部署在 claude-2'));
-  assert.ok(mem.systemPrompt('', [], null).includes('（还是空的）'));
-  assert.ok(mem.systemPrompt('', [], 'x'.repeat(30_000)).includes('被截断'));
+  assert.ok(sys.includes('/home/box/.pagent/agents/b/claude/memory/') && sys.includes('/workspace/运维值班/'));
+  assert.ok(mem.systemPrompt('', '', [], null).includes('（还是空的）'));
+  assert.ok(mem.systemPrompt('', '', [], 'x'.repeat(30_000)).includes('被截断'));
 });
 
 test('新会话：旧会话归档，排队的消息挪过去，没回答的选择卡作废', () => {
@@ -152,7 +153,8 @@ test('pagent MCP：凭据校验、工具列表、remember、ask_user、new_sessi
 
   assert.equal((await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, 'wrong')).status, 401);
   const list = await (await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' })).json();
-  assert.deepEqual(list.result.tools.map((t: any) => t.name), ['remember', 'ask_user', 'new_session']);
+  const names = list.result.tools.map((t: any) => t.name);
+  for (const n of ['remember', 'ask_user', 'request_takeover', 'notify_user', 'create_routine', 'new_session']) assert.ok(names.includes(n), n);
   assert.equal((await rpc({ jsonrpc: '2.0', method: 'notifications/initialized' })).status, 202);
 
   assert.equal((await call('remember', { text: '用户住在上海' })).isError, false);
@@ -175,9 +177,10 @@ test('pagent MCP：凭据校验、工具列表、remember、ask_user、new_sessi
 });
 
 test('记忆送达：没变化不补发；人设、全局记忆增删改、MEMORY.md 变化都补发；老会话补发全文', () => {
-  const base = mem.snap('你是运维', [{ id: 'mem_a', text: '用户叫 Oak' }, { id: 'mem_b', text: '用户住上海' }] as any, '- 职责：值班');
+  const g = mem.guideFor('运维', '/m');
+  const base = mem.snap('你是运维', g, [{ id: 'mem_a', text: '用户叫 Oak' }, { id: 'mem_b', text: '用户住上海' }] as any, '- 职责：值班');
   assert.equal(mem.updateBlock(base, base), '');
-  const cur = mem.snap('你是运维，说话简短', [{ id: 'mem_a', text: '用户叫 Oak Shen' }, { id: 'mem_c', text: '用户养猫' }] as any, '- 职责：值班\n- 用 compose 部署');
+  const cur = mem.snap('你是运维，说话简短', g, [{ id: 'mem_a', text: '用户叫 Oak Shen' }, { id: 'mem_c', text: '用户养猫' }] as any, '- 职责：值班\n- 用 compose 部署');
   const u = mem.updateBlock(base, cur);
   assert.ok(u.startsWith('<pagent-update>'));
   for (const s of ['你是运维，说话简短', '+ [mem_c] 用户养猫', '~ [mem_a] 用户叫 Oak Shen', '- [mem_b] 已删除：用户住上海', '- 用 compose 部署']) assert.ok(u.includes(s), s);
@@ -186,4 +189,94 @@ test('记忆送达：没变化不补发；人设、全局记忆增删改、MEMOR
   assert.ok(onlyG.includes('+ [mem_d]') && !onlyG.includes('人设') && !onlyG.includes('MEMORY.md'));
   const full = mem.updateBlock(null, cur);
   assert.ok(full.startsWith('<pagent-context>') && full.includes('你是运维，说话简短') && full.includes('[mem_c] 用户养猫') && full.includes('ask_user'));
+  // 工作方式说明变了（搬进盒子、记忆目录换地方）：整段重发；P4 之前的快照没有 guide，也算变了
+  const moved = mem.updateBlock(base, { ...base, guide: mem.guideFor('运维', '/new') });
+  assert.ok(moved.includes('工作方式说明有更新') && moved.includes('/new/') && !moved.includes('你的人设已更新'));
+  const { guide: _g, ...old } = base;
+  assert.ok(mem.updateBlock(old, base).includes('工作方式说明有更新'));
+});
+
+test('cron：下一次触发时间（Asia/Shanghai）', async () => {
+  const { nextFire, parseCron } = await import('../src/routines.ts');
+  // 2026-11-02 07:59:30 +08:00 → 每天 8 点 = 当天 08:00
+  const t0 = Date.parse('2026-11-02T07:59:30+08:00');
+  assert.equal(new Date(nextFire('0 8 * * *', t0)!).toISOString(), '2026-11-02T00:00:00.000Z');
+  // 刚过 8 点 → 明天
+  assert.equal(new Date(nextFire('0 8 * * *', Date.parse('2026-11-02T08:00:00+08:00'))!).toISOString(), '2026-11-03T00:00:00.000Z');
+  // 工作日 9:30：2026-11-07 是周六 → 下周一 11-09
+  assert.equal(new Date(nextFire('30 9 * * 1-5', Date.parse('2026-11-07T10:00:00+08:00'))!).toISOString(), '2026-11-09T01:30:00.000Z');
+  assert.equal(new Date(nextFire('*/15 * * * *', Date.parse('2026-11-02T10:16:00+08:00'))!).toISOString(), '2026-11-02T02:30:00.000Z');
+  assert.throws(() => parseCron('0 8 * *'));
+  assert.throws(() => parseCron('61 8 * * *'));
+});
+
+test('Routine：触发后排进当前会话；NO_NEWS 安静收尾，有内容才通知', async () => {
+  const { store, botId, runId } = fixture();
+  const { createRoutine, fireRoutine } = await import('../src/routines.ts');
+  const runner = new TestRunner(store);
+  store.run("UPDATE runs SET status = 'succeeded' WHERE id = ?", runId);
+  const r = createRoutine(store, botId, { name: '盘前要闻', prompt: '整理要闻', schedule: '0 8 * * *' }, '用户');
+  assert.ok(r.nextAt);
+  const row = store.get<any>('SELECT * FROM routines WHERE id = ?', r.id);
+  fireRoutine(store, runner, row, 'manual');
+  const msg = store.get<any>("SELECT * FROM messages WHERE status = 'queued'");
+  assert.equal(JSON.parse(msg.meta).routine.name, '盘前要闻');
+  assert.ok(msg.content.includes('NO_NEWS'));
+  // 模拟这一轮：消费消息、结果是 NO_NEWS
+  const evs: PagentEvent[] = [];
+  const on = (e: PagentEvent) => evs.push(e);
+  bus.on('event', on);
+  for (const [text, quiet] of [['NO_NEWS', true], ['今天有 3 条要闻……', false]] as const) {
+    const run2 = newId('run');
+    store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at, final) VALUES (?,?,?, 'running', 't', ?, ?)",
+      run2, msg.thread_id, botId, now(), JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: text }));
+    store.run('UPDATE messages SET status = ?, run_id = ? WHERE id = ?', 'consumed', run2, msg.id);
+    (runner as any).finish({ botId, threadId: msg.thread_id, runId: run2 }, null);
+    const done = evs.filter((e) => e.type === 'routine.fired' && e.runId === run2)[0];
+    assert.equal(done.data.quiet, quiet);
+    assert.equal(evs.some((e) => e.type === 'notify' && e.runId === run2), !quiet);
+  }
+  bus.off('event', on);
+});
+
+test('Web Push 加密：RFC 8291 附录的示例', async () => {
+  const { encrypt } = await import('../src/push.ts');
+  const b = (s: string) => Buffer.from(s, 'base64url');
+  const out = encrypt(Buffer.from('When I grow up, I want to be a watermelon'),
+    b('BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4'), b('BTBZMqHH6r4Tts7J_aSIgg'),
+    { salt: b('DGv6ra1nlYgDCS1FRnbzlw'), asPrivate: b('yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw') });
+  assert.equal(out.toString('base64url'),
+    'DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN');
+});
+
+test('协作：message_agent 排进对方会话，回复自动发回；层数到上限被拒；群消息交给总管', async () => {
+  const { store, botId, runId } = fixture();
+  const { messageAgent, forwardReplies, createGroup, postToGroup, MAX_DEPTH } = await import('../src/collab.ts');
+  const runner = new TestRunner(store);
+  const otherId = newId('bot');
+  store.run("INSERT INTO bots(id, name, created_at) VALUES (?, '研究员', ?)", otherId, now());
+  const me = store.get<any>('SELECT * FROM bots WHERE id = ?', botId);
+  const other = store.get<any>('SELECT * FROM bots WHERE id = ?', otherId);
+  messageAgent(store, runner, me, runId, '研究员', '查一下 A');
+  const got = store.get<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", otherId);
+  const meta = JSON.parse(got.meta);
+  assert.deepEqual([meta.from, meta.replyTo, meta.depth], ['小助手', botId, 1]);
+  assert.throws(() => messageAgent(store, runner, me, runId, '小助手', 'x'), /自己/);
+  // 对方做完：回复发回给我，标记 reply，不会再要求回复
+  forwardReplies(store, runner, other, 'succeeded', 'A 是 42', [meta]);
+  const back = store.all<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", botId);
+  assert.equal(back.length, 1);
+  assert.ok(back[0].content.includes('A 是 42'));
+  assert.equal(JSON.parse(back[0].meta).reply, true);
+  forwardReplies(store, runner, me, 'succeeded', '收到', [JSON.parse(back[0].meta)]);
+  assert.equal(store.all<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", otherId).length, 1);
+  // 层数到上限
+  const deep = newId('run');
+  store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at) VALUES (?,?,?, 'running', 't', ?)", deep, got.thread_id, otherId, now());
+  store.run('UPDATE messages SET status = ?, run_id = ?, meta = ? WHERE id = ?', 'consumed', deep, JSON.stringify({ depth: MAX_DEPTH }), got.id);
+  assert.throws(() => messageAgent(store, runner, other, deep, '小助手', '再转'), /上限/);
+  // 群：没 @ 交给总管，@ 到谁就给谁
+  const g = createGroup(store, { name: '小组', members: ['小助手', '研究员'], manager: '小助手' }, '用户');
+  assert.deepEqual(postToGroup(store, runner, g.id, '做个调研', '用户').targets, ['小助手']);
+  assert.deepEqual(postToGroup(store, runner, g.id, '@研究员 你来', '用户').targets, ['研究员']);
 });

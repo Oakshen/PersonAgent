@@ -169,16 +169,16 @@ function describePermissions(m: any): string {
 }
 
 const USAGE = `用法：
-  pagent bot create <name> [--persona 文本] [--model 模型] [--max-turns N]
+  pagent bot create <name> [--persona 文本] [--engine claude|codex] [--model 模型] [--max-turns N]
   pagent bot ls | pagent bot show <name>
-  pagent bot set <name> [--max-turns N] [--daily-turns N] [--max-seconds N] [--max-actions N]
+  pagent bot set <name> [--engine claude|codex] [--max-turns N] [--daily-turns N] [--max-seconds N] [--max-actions N]
   pagent backup
   pagent chat <bot> [--new] [--interrupt] <消息…>      --new：先开一条新会话（记忆保留）
   pagent session new <bot>
   pagent memory [bot]                                  不带 bot：关于你的全局记忆；带 bot：它自己的记忆文件
   pagent remember <文本…> | pagent forget <记忆编号>
   pagent runs [bot] | pagent run <runId> | pagent interrupt <runId>
-  pagent device pair <设备名> [--scopes chat,admin] | pagent device ls | pagent device revoke <id>
+  pagent device pair <设备名> [--scopes chat,admin|local] | pagent device ls | pagent device revoke <id>
   pagent events [--after N] [-f]
   pagent plugin install <目录> | pagent plugin ls | pagent plugin show <id>
   pagent plugin enable <bot> <id> [--yes] | pagent plugin disable <bot> <id> | pagent plugin bot <bot>`;
@@ -192,18 +192,19 @@ async function main(argv: string[]) {
         const persona = flag(rest, '--persona');
         const model = flag(rest, '--model');
         const maxTurns = flag(rest, '--max-turns');
-        const b: Bot = await call('POST', '/bots', { name, persona, model, maxTurns: maxTurns ? Number(maxTurns) : undefined });
+        const engine = flag(rest, '--engine');
+        const b: Bot = await call('POST', '/bots', { name, persona, model, engine, maxTurns: maxTurns ? Number(maxTurns) : undefined });
         return console.log(`已创建 ${b.name}（${b.id}）`);
       }
-      if (sub === 'ls') return table(await call('GET', '/bots'), ['name', 'id', 'model', 'maxTurns', 'createdAt']);
+      if (sub === 'ls') return table(await call('GET', '/bots'), ['name', 'id', 'engine', 'model', 'maxTurns', 'createdAt']);
       if (sub === 'show') return console.log(JSON.stringify(await call('GET', `/bots/${encodeURIComponent(name)}`), null, 2));
       if (sub === 'set') {
         const num = (f: string) => { const v = flag(rest, f); return v === undefined ? undefined : Number(v); };
         const b = await call('PATCH', `/bots/${encodeURIComponent(name)}`, {
           maxTurns: num('--max-turns'), dailyTurnBudget: num('--daily-turns'),
-          maxRunSeconds: num('--max-seconds'), maxActions: num('--max-actions'),
+          maxRunSeconds: num('--max-seconds'), maxActions: num('--max-actions'), engine: flag(rest, '--engine'),
         });
-        return console.log(`${b.name}：maxTurns=${b.maxTurns} dailyTurnBudget=${b.dailyTurnBudget} maxRunSeconds=${b.maxRunSeconds} maxActions=${b.maxActions}`);
+        return console.log(`${b.name}：engine=${b.engine} maxTurns=${b.maxTurns} dailyTurnBudget=${b.dailyTurnBudget} maxRunSeconds=${b.maxRunSeconds} maxActions=${b.maxActions}`);
       }
       break;
     }

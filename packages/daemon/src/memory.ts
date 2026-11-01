@@ -1,6 +1,6 @@
 // 两层记忆。
 // - 全局记忆（关于用户）：存在库里，任何 Agent 经 pagent MCP 的 remember 写入，pagentd 串行写并记录来源。
-// - Agent 记忆：它自己家里的 ~/.claude/memory/，MEMORY.md 是索引，Agent 用文件工具直接改。
+// - Agent 记忆：盒子里它自己配置目录下的 memory/（$CLAUDE_CONFIG_DIR/memory），MEMORY.md 是索引，Agent 用文件工具直接改。
 // 一条会话的系统提示在第一轮就固定了（claude --resume 会忽略新的 --append-system-prompt），所以：
 // - 新会话第一轮：人设 + 说明 + 两层记忆全文写进系统提示；
 // - 之后每轮：和"已经送达的版本"比对，有变化就在用户消息前补发一段更新；
@@ -129,7 +129,7 @@ export function diffFiles(before: Map<string, string>, after: Map<string, string
 
 // ---- 系统提示 ----
 
-const GUIDE = `# 你的记忆
+const guide = (memDir: string) => `# 你的记忆
 
 你有两层长期记忆，跨会话保留。对话上下文会被压缩、也可能换成新会话，但记忆不会丢。
 
@@ -137,7 +137,7 @@ const GUIDE = `# 你的记忆
 
 写到哪：
 - 关于用户本人的事（称呼、偏好、常用账号和设备、家庭和工作背景、正在推进的大事）→ 调用 \`mcp__pagent__remember\`。这是所有 Agent 共享的全局记忆。更正已有条目时带上它的编号（replaces），不要另写一条互相矛盾的。
-- 关于你自己工作的事（负责什么、做过的决定、工作方法、踩过的坑）→ 直接编辑 \`~/.claude/memory/\` 下的文件。\`MEMORY.md\` 是索引，每行一条、尽量短；细节放进按主题分的文件（如 \`deploy.md\`），在索引里写一行指向它。
+- 关于你自己工作的事（负责什么、做过的决定、工作方法、踩过的坑）→ 直接编辑 \`${memDir}/\` 下的文件（也就是 \`$CLAUDE_CONFIG_DIR/memory/\`；注意不是 \`~/.claude/memory/\`）。\`MEMORY.md\` 是索引，每行一条、尽量短；细节放进按主题分的文件（如 \`deploy.md\`），在索引里写一行指向它。
 
 不要写进记忆：密码、token、密钥等凭据；一次性的过程细节。记忆错了就当场改掉或删掉。`;
 
@@ -147,7 +147,18 @@ const CONDUCT = `# 和用户的沟通方式
 - 只有缺少关键信息、或者有几条路必须由用户拿主意时，才停下来问。需要用户在几个选项里挑一个时，一律调用 \`mcp__pagent__ask_user\`（用户会看到一张可以直接点的选择卡），不要把选项写在回复正文里。调用之后这一轮就结束，等用户回答，不要接着干。
 - 对话已经很长、或者话题彻底换了，可以调用 \`mcp__pagent__new_session\`：下一轮换一条新会话，记忆都还在。`;
 
-export function systemPrompt(persona: string, globals: MemoryEntry[], agentIndex: string | null): string {
+const box = (name: string) => `# 这台电脑
+
+你是 Agent「${name}」，和用户的其他 Agent 共用这台 Linux 电脑（用户 box，可以 sudo）。
+- \`/workspace\` 是大家共享的工作区，你的东西放在 \`/workspace/${name}/\` 下；\`/home/box\` 里的命令行登录（gh、ssh、各种 CLI）、npm -g / pip --user 装的工具都共享，一个 Agent 登录过，别的 Agent 直接能用。
+- skill 装到 \`$CLAUDE_CONFIG_DIR/skills/\`（和 \`~/.claude/skills/\` 是同一个共享目录），所有 Agent 下一轮都能用。
+- 只改你自己的记忆目录，不要动其他 Agent 的。
+- 用 apt 装的系统软件在电脑重建时会丢，要长期用的工具优先装进 /home/box。`;
+
+/** 工作方式说明（人设之后、记忆之前的固定部分），记忆目录是盒子里的路径 */
+export const guideFor = (name: string, memDir: string) => [guide(memDir), CONDUCT, box(name)].join('\n\n');
+
+export function systemPrompt(persona: string, guideText: string, globals: MemoryEntry[], agentIndex: string | null): string {
   const g = globals.length
     ? globals.map((m) => `- [${m.id}] ${m.text}`).join('\n')
     : '（还没有）';
@@ -155,23 +166,23 @@ export function systemPrompt(persona: string, globals: MemoryEntry[], agentIndex
   if (idx.length > AGENT_INDEX_MAX) idx = `${idx.slice(0, AGENT_INDEX_MAX)}\n…（索引太长被截断，请精简 MEMORY.md）`;
   return [
     persona.trim(),
-    GUIDE,
-    CONDUCT,
+    guideText,
     `## 关于用户（全局记忆）\n${g}`,
-    `## 你自己的记忆（~/.claude/memory/MEMORY.md）\n${idx}`,
+    `## 你自己的记忆（MEMORY.md）\n${idx}`,
   ].filter(Boolean).join('\n\n');
 }
 
 // ---- 会话内的记忆送达 ----
 
-/** 人设和记忆在某一时刻的样子 */
-export interface MemSnap { persona: string; globals: Record<string, string>; index: string }
+/** 人设、工作方式说明和记忆在某一时刻的样子。guide 是 P4 加的，更早的快照里没有 */
+export interface MemSnap { persona: string; guide?: string; globals: Record<string, string>; index: string }
 
-export const snap = (persona: string, globals: MemoryEntry[], index: string | null): MemSnap =>
-  ({ persona: persona.trim(), globals: Object.fromEntries(globals.map((m) => [m.id, m.text])), index: (index ?? '').trim() });
+export const snap = (persona: string, guideText: string, globals: MemoryEntry[], index: string | null): MemSnap => ({
+  persona: persona.trim(), guide: guideText, globals: Object.fromEntries(globals.map((m) => [m.id, m.text])), index: (index ?? '').trim(),
+});
 
 export const promptOf = (s: MemSnap) =>
-  systemPrompt(s.persona, Object.entries(s.globals).map(([id, text]) => ({ id, text }) as MemoryEntry), s.index);
+  systemPrompt(s.persona, s.guide ?? '', Object.entries(s.globals).map(([id, text]) => ({ id, text }) as MemoryEntry), s.index);
 
 /** 比上次送达的版本多了什么；没变化返回空串。prev 为 null（老会话从没收到过）时补发全文。 */
 export function updateBlock(prev: MemSnap | null, cur: MemSnap): string {
@@ -180,6 +191,8 @@ export function updateBlock(prev: MemSnap | null, cur: MemSnap): string {
   }
   const parts: string[] = [];
   if (prev.persona !== cur.persona) parts.push(`## 你的人设已更新，现在是：\n${cur.persona || '（空）'}`);
+  // 工作方式说明变了（比如搬进共享盒子后记忆目录换了地方）：整段重发，之前的说法作废
+  if (prev.guide !== cur.guide) parts.push(`## 工作方式说明有更新，以下面这版为准（之前的说法作废）\n\n${cur.guide}`);
   const g: string[] = [];
   for (const [id, text] of Object.entries(cur.globals)) {
     if (!(id in prev.globals)) g.push(`+ [${id}] ${text}`);

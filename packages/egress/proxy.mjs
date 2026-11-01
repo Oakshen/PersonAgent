@@ -12,8 +12,11 @@ import { readFileSync } from 'node:fs';
 
 let rules = {};
 let ipToName = new Map();
+// 可选的上游代理（按容器名）：比如让盒子的公网流量走家里的住宅线路。目标照样先在这里校验过。
+let upstreams = {};
 async function refresh() {
   try { rules = JSON.parse(readFileSync(process.env.RULES_FILE, 'utf8')); } catch {}
+  try { upstreams = process.env.UPSTREAMS_FILE ? JSON.parse(readFileSync(process.env.UPSTREAMS_FILE, 'utf8')) : {}; } catch { upstreams = {}; }
   const next = new Map();
   for (const name of Object.keys(rules)) {
     try { for (const { address } of await dns.lookup(name, { all: true })) next.set(address, name); } catch {}
@@ -58,9 +61,22 @@ async function doh(host) {
   return ips;
 }
 
+const whoOf = (srcIp) => ipToName.get(String(srcIp).replace(/^::ffff:/, '')) ?? 'unknown';
+
+/** 这个来源要不要经上游代理出去；返回 { host, port, auth } 或 null */
+function upstreamFor(srcIp) {
+  const u = upstreams[whoOf(srcIp)];
+  if (!u) return null;
+  try {
+    const url = new URL(u);
+    const auth = url.username ? Buffer.from(`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`).toString('base64') : null;
+    return { host: url.hostname, port: Number(url.port || 80), auth };
+  } catch { return null; }
+}
+
 /** 决定是否放行；放行时返回要连接的 IP。 */
 export async function decide(srcIp, host, port, lookup = dns.lookup, realLookup = doh) {
-  const who = ipToName.get(String(srcIp).replace(/^::ffff:/, '')) ?? 'unknown';
+  const who = whoOf(srcIp);
   const target = `${host}:${port}`;
   const list = rules[who] ?? [];
   const exact = list.includes(target);
@@ -77,7 +93,7 @@ export async function decide(srcIp, host, port, lookup = dns.lookup, realLookup 
       if (!ip && !reason) reason = 'no_address';
     } catch { reason = 'dns_failed'; }
   }
-  console.log(JSON.stringify({ t: new Date().toISOString(), who, target, ip, decision: ip ? 'allow' : 'deny', reason }));
+  console.log(JSON.stringify({ t: new Date().toISOString(), who, target, ip, decision: ip ? 'allow' : 'deny', reason, via: ip && upstreams[who] ? 'upstream' : undefined }));
   return ip;
 }
 
@@ -94,7 +110,12 @@ function start() {
     const headers = { ...req.headers };
     const inj = process.env.INJECT_TARGET === `${host}:${port}` && process.env.INJECT_TOKEN;
     if (inj) { delete headers['x-api-key']; headers.authorization = `Bearer ${inj}`; }
-    const up = http.request({ host: ip, port, path: u.pathname + u.search, method: req.method, headers }, (r) => {
+    const via = upstreamFor(req.socket.remoteAddress);
+    if (via?.auth) headers['proxy-authorization'] = `Basic ${via.auth}`;
+    const target = via
+      ? { host: via.host, port: via.port, path: `http://${net.isIPv6(ip) ? `[${ip}]` : ip}:${port}${u.pathname}${u.search}` }
+      : { host: ip, port, path: u.pathname + u.search };
+    const up = http.request({ ...target, method: req.method, headers }, (r) => {
       res.writeHead(r.statusCode, r.headers); r.pipe(res);
     });
     up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
@@ -107,7 +128,27 @@ function start() {
     const [, host, port] = m;
     const ip = await decide(sock.remoteAddress, host, port);
     if (!ip) { sock.end('HTTP/1.1 403 Forbidden\r\n\r\n'); return; }
-    const up = net.connect(+port, ip, () => { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.write(head); up.pipe(sock); sock.pipe(up); });
+    const via = upstreamFor(sock.remoteAddress);
+    const dest = `${net.isIPv6(ip) ? `[${ip}]` : ip}:${port}`;
+    const up = via ? net.connect(via.port, via.host) : net.connect(+port, ip);
+    const established = () => { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.write(head); up.pipe(sock); sock.pipe(up); };
+    up.on('connect', () => {
+      if (!via) return established();
+      // 经上游代理：先对上游发 CONNECT（用校验过的 IP，不让上游再解析一遍）
+      up.write(`CONNECT ${dest} HTTP/1.1\r\nHost: ${dest}\r\n${via.auth ? `Proxy-Authorization: Basic ${via.auth}\r\n` : ''}\r\n`);
+      let buf = Buffer.alloc(0);
+      const onData = (d) => {
+        buf = Buffer.concat([buf, d]);
+        const end = buf.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        up.off('data', onData);
+        if (!/^HTTP\/1\.[01] 200/.test(buf.toString('latin1', 0, 16))) { sock.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); up.destroy(); return; }
+        const rest = buf.subarray(end + 4);
+        established();
+        if (rest.length) sock.write(rest);
+      };
+      up.on('data', onData);
+    });
     up.on('error', () => sock.destroy());
     sock.on('error', () => up.destroy());
     sock.on('close', () => up.destroy());

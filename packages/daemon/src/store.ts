@@ -68,6 +68,22 @@ CREATE TABLE IF NOT EXISTS device_sessions (
   token_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id), expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS routines (
+  id TEXT PRIMARY KEY, bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE, name TEXT NOT NULL, prompt TEXT NOT NULL,
+  schedule TEXT, webhook_token TEXT UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL, last_fired_at TEXT, next_at TEXT
+);
+CREATE TABLE IF NOT EXISTS secrets (
+  name TEXT PRIMARY KEY, ciphertext TEXT NOT NULL, iv TEXT NOT NULL, tag TEXT NOT NULL, note TEXT,
+  updated_at TEXT NOT NULL, updated_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_subs (
+  endpoint TEXT PRIMARY KEY, device_id TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS groups (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, members TEXT NOT NULL, manager_id TEXT, created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_events_bot ON events(bot_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, status);
 CREATE INDEX IF NOT EXISTS idx_runs_thread ON runs(thread_id, status);
@@ -97,6 +113,12 @@ export class Store {
       ['threads', 'archived_at', 'TEXT'],
       ['threads', 'mem_base', 'TEXT'],
       ['threads', 'mem_delivered', 'TEXT'],
+      ['runs', 'final', 'TEXT'],
+      ['messages', 'meta', 'TEXT'],
+      ['devices', 'local_exec', "TEXT NOT NULL DEFAULT 'off'"],
+      ['devices', 'local_root', 'TEXT'],
+      ['bots', 'engine', "TEXT NOT NULL DEFAULT 'claude'"],
+      ['asks', 'kind', "TEXT NOT NULL DEFAULT 'choice'"],
     ];
     for (const [table, col, def] of add) {
       const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
@@ -154,6 +176,13 @@ export class Store {
     return this.db.prepare(sql).run(...params);
   }
 
+  getKv(k: string): string | null {
+    return this.get<{ v: string }>('SELECT v FROM kv WHERE k = ?', k)?.v ?? null;
+  }
+  setKv(k: string, v: string): void {
+    this.run('INSERT INTO kv(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', k, v);
+  }
+
   eventsAfter(seq: number, limit = 500): PagentEvent[] {
     return this.all<EventRow>('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?', seq, limit).map(toEvent);
   }
@@ -169,6 +198,7 @@ const toEvent = (r: EventRow): PagentEvent => ({
 export interface BotRow {
   id: string; name: string; persona: string; model: string | null; policy: string; max_turns: number; created_at: string;
   daily_turn_budget: number; max_run_seconds: number; max_actions: number;
+  engine: string;   // claude | codex
 }
 // mem_base：会话第一轮写进系统提示的人设和记忆（会话期间不会再变）；mem_delivered：在此基础上又补发过的更新。都是 MemSnap JSON
 export interface ThreadRow {
@@ -180,7 +210,8 @@ export interface RunRow {
   id: string; thread_id: string; bot_id: string; status: string; hook_token: string; interrupt_requested: number;
   num_turns: number | null; cost_usd: number | null; usage: string | null; result: string | null; error: string | null;
   started_at: string; ended_at: string | null;
+  final: string | null;   // claude 最后那条 result 消息（JSON），一到就落库，pagentd 重启也不丢
 }
 export interface ActionRow { id: string; run_id: string; tool_use_id: string | null; tool: string; input: string; side_effect: number; status: string; reason: string | null; created_at: string; updated_at: string }
 export interface MemoryRow { id: string; text: string; source_bot_id: string | null; source_run_id: string | null; created_at: string; updated_at: string; deleted_at: string | null }
-export interface AskRow { id: string; run_id: string; bot_id: string; thread_id: string; question: string; options: string; allow_custom: number; answer: string | null; created_at: string; answered_at: string | null }
+export interface AskRow { kind: string; id: string; run_id: string; bot_id: string; thread_id: string; question: string; options: string; allow_custom: number; answer: string | null; created_at: string; answered_at: string | null }

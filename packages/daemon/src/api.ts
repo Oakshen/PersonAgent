@@ -1,4 +1,4 @@
-// 本机管理 API：只监听 unix socket（0600），worker 所在的网络够不到它。
+// 本机管理 API：只监听 unix socket（0600），盒子所在的网络够不到它。
 // 手机 / 远程设备的入口见 remote.ts（设备认证）。
 import http from 'node:http';
 import { chmodSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -16,9 +16,10 @@ import type { Devices, Scope } from './devices.ts';
 import { readBody, send } from './http.ts';
 import type { Runner } from './runner.ts';
 import type { Bot } from '../../protocol/src/types.ts';
+import { engineOf } from './engines.ts';
 
 export const toBot = (r: BotRow): Bot => ({
-  id: r.id, name: r.name, persona: r.persona, model: r.model,
+  id: r.id, name: r.name, persona: r.persona, model: r.model, engine: r.engine === 'codex' ? 'codex' : 'claude',
   maxTurns: r.max_turns, dailyTurnBudget: r.daily_turn_budget,
   maxRunSeconds: r.max_run_seconds, maxActions: r.max_actions, createdAt: r.created_at,
 });
@@ -51,6 +52,10 @@ export function startApi(store: Store, runner: Runner, devices: Devices, sock: s
         posInt(b.dailyTurnBudget, 'dailyTurnBudget') ?? bot.daily_turn_budget,
         posInt(b.maxRunSeconds, 'maxRunSeconds') ?? bot.max_run_seconds,
         posInt(b.maxActions, 'maxActions') ?? bot.max_actions, bot.id);
+      if (b.engine !== undefined && engineOf(b.engine) !== engineOf(bot.engine)) {
+        store.run('UPDATE bots SET engine = ? WHERE id = ?', engineOf(b.engine), bot.id);
+        newSession(store, runner, bot.name, `cli（换成 ${engineOf(b.engine)}）`);
+      }
       return toBot(store.get<BotRow>('SELECT * FROM bots WHERE id = ?', bot.id)!);
     }],
     ['POST', /^\/bots\/([^/]+)\/messages$/, (m, b) => {

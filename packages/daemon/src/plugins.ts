@@ -108,6 +108,12 @@ function enabledFor(store: Store, botId: string): { ok: Enabled[]; stale: string
   return { ok, stale };
 }
 
+/** 本 Bot 通过插件拿到的 skill：插件编号 + skill 目录 */
+export function pluginSkills(store: Store, botId: string): { plugin: string; dir: string }[] {
+  return enabledFor(store, botId).ok.flatMap(({ plugin, manifest }) =>
+    (manifest.contributes.skills ?? []).map((s) => ({ plugin: manifest.id, dir: join(plugin.dir, 'pkg', s) })));
+}
+
 export interface RunPlugins { servers: Record<string, unknown>; pluginDirs: string[]; stale: string[] }
 
 /** 每轮开跑前：拉起 MCP 插件容器，组装 --mcp-config 里的插件部分和 --plugin-dir */

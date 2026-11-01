@@ -10,6 +10,7 @@ export interface Bot {
   name: string;
   persona: string;
   model: string | null;
+  engine: 'claude' | 'codex'; // claude：Claude Code（claude -p）；codex：Codex CLI（ChatGPT 订阅）
   maxTurns: number;          // 单轮 claude 内部最大轮次（--max-turns）
   dailyTurnBudget: number;   // 每天（UTC）累计轮次上限；订阅模式算不准费用，按轮次限
   maxRunSeconds: number;     // 单轮最长时长，超时自动中断
@@ -53,7 +54,15 @@ export type EventType =
   | 'ask.answered'
   | 'plugin.needs_consent'
   | 'device.paired'
-  | 'device.revoked';
+  | 'device.revoked'
+  | 'screen.takeover'      // 用户接管 / 交还某个 Agent 的屏幕
+  | 'notify'               // Agent 主动通知用户（notify_user、Routine 有新内容）
+  | 'routine.changed'      // Routine 新建 / 修改 / 删除
+  | 'routine.fired'        // Routine 被触发（定时或 webhook）
+  | 'agent.message'        // Agent 之间发消息
+  | 'group.changed'        // 群聊新建 / 改成员
+  | 'secret.changed'       // 保险箱条目变了（只有名字，没有值）
+  | 'engine.changed';      // 引擎登录状态变了
 
 /** Bot 在名单上的状态（印章角标）。asking：它问了你一个问题，还没回答 */
-export type BotStatus = 'idle' | 'working' | 'asking' | 'failed';
+export type BotStatus = 'idle' | 'working' | 'computer' | 'asking' | 'failed';

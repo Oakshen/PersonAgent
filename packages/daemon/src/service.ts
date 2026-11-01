@@ -1,4 +1,5 @@
 // 本机 API 与远程 API 共用的操作。
+import { engineOf } from './engines.ts';
 import type http from 'node:http';
 import { type AskRow, type BotRow, type RunRow, type Store, bus, newId, now } from './store.ts';
 import { type Runner, agentMemoryDir } from './runner.ts';
@@ -13,15 +14,15 @@ export class ServiceError extends Error {
 // 名字可以用中文；不能有空格和斜杠（要放进 URL 和命令行参数）
 export const BOT_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,30}$/u;
 
-export function createBot(store: Store, b: { name?: string; persona?: string; model?: string | null; maxTurns?: number }): BotRow {
+export function createBot(store: Store, b: { name?: string; persona?: string; model?: string | null; maxTurns?: number; engine?: string }): BotRow {
   const name = String(b?.name ?? '').trim();
   if (!BOT_NAME_RE.test(name)) throw new ServiceError(400, '名字 1~31 个字符，只能用文字、数字、- 和 _，不能有空格');
   if (store.get('SELECT 1 FROM bots WHERE name = ?', name)) throw new ServiceError(409, `已经有叫 ${name} 的 Bot 了`);
   const persona = String(b.persona ?? '').slice(0, 4000);
   const id = newId('bot');
   store.tx(() => {
-    store.run('INSERT INTO bots(id, name, persona, model, max_turns, created_at) VALUES (?,?,?,?,?,?)',
-      id, name, persona, b.model || null, b.maxTurns ?? 30, now());
+    store.run('INSERT INTO bots(id, name, persona, model, max_turns, engine, created_at) VALUES (?,?,?,?,?,?,?)',
+      id, name, persona, b.model || null, b.maxTurns ?? 30, engineOf(b.engine), now());
     store.emit('bot.created', { name }, { botId: id });
   });
   return store.get<BotRow>('SELECT * FROM bots WHERE id = ?', id)!;
@@ -62,7 +63,12 @@ export function newSession(store: Store, runner: Runner, botName: string, by: st
 
 export function botStatus(store: Store, botId: string): BotStatus {
   const has = (sql: string) => !!store.get(sql, botId);
-  if (has("SELECT 1 FROM runs WHERE bot_id = ? AND status = 'running'")) return 'working';
+  const running = store.get<{ id: string }>("SELECT id FROM runs WHERE bot_id = ? AND status = 'running'", botId);
+  if (running) {
+    // 最近一次工具调用是屏幕 / 浏览器：正在用电脑
+    const t = store.get<{ tool: string }>('SELECT tool FROM actions WHERE run_id = ? ORDER BY created_at DESC LIMIT 1', running.id);
+    return t && /^mcp__(screen|browser)__/.test(t.tool) ? 'computer' : 'working';
+  }
   if (has('SELECT 1 FROM asks WHERE bot_id = ? AND answered_at IS NULL')) return 'asking';
   const last = store.get<{ status: string }>('SELECT status FROM runs WHERE bot_id = ? ORDER BY started_at DESC LIMIT 1', botId);
   return last?.status === 'failed' ? 'failed' : 'idle';
@@ -75,7 +81,7 @@ export function snapshot(store: Store) {
       const last = store.get<{ ts: string; type: string; data: string }>(
         "SELECT ts, type, data FROM events WHERE bot_id = ? AND type IN ('assistant.text', 'message.queued') ORDER BY seq DESC LIMIT 1", b.id);
       return {
-        id: b.id, name: b.name, persona: b.persona, model: b.model, createdAt: b.created_at, status: botStatus(store, b.id),
+        id: b.id, name: b.name, persona: b.persona, model: b.model, engine: engineOf(b.engine), createdAt: b.created_at, status: botStatus(store, b.id),
         lastText: last ? String(JSON.parse(last.data).text ?? '').slice(0, 120) : null,
         lastAt: last?.ts ?? null,
       };

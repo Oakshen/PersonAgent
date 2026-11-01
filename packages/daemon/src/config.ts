@@ -20,4 +20,6 @@ export const config = {
   hostCred: process.env.PAGENT_HOST_CRED || null,
   sandboxNet: env('PAGENT_SANDBOX_NET', 'pagent_sandbox'),
   approvalTtlSec: Number(env('PAGENT_APPROVAL_TTL', '540')),
+  remotePort: Number(env('PAGENT_REMOTE_PORT', '7780')),
+  webDir: env('PAGENT_WEB_DIR'),
 };

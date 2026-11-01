@@ -49,4 +49,10 @@ export type EventType =
   | 'action.completed'
   | 'approval.requested'
   | 'approval.resolved'
-  | 'plugin.needs_consent';
+  | 'plugin.needs_consent'
+  | 'action.reconciled'
+  | 'device.paired'
+  | 'device.revoked';
+
+/** Bot 在名单上的状态（头像角标） */
+export type BotStatus = 'idle' | 'working' | 'waiting' | 'attention' | 'failed';

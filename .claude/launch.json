@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pagent-web",
+      "runtimeExecutable": "ssh",
+      "runtimeArgs": ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L", "7780:127.0.0.1:7780", "claude-2"],
+      "port": 7780
+    }
+  ]
+}

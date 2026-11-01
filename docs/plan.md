@@ -217,7 +217,7 @@ deploy/
 |---|---|---|
 | **P0 前提验证** ✅ 2026-11-01（docs/p0-findings.md） | 在 worker 容器里跑官方 `claude` 并登录；验证 stream-json、resume、interrupt、permission-prompt-tool、出口代理；验证一个 MCP 插件能在独立沙箱里经代理运行 | 写出一页结论：能控住什么、控不住什么、中断和恢复各是什么表现 |
 | **P1 单 Bot 闭环** ✅ 2026-11-01（docs/p1-notes.md） | daemon + CLI；Bot 增删改查；Thread 队列；Run/Action/Approval 状态机；策略引擎；预算；事件 outbox；备份；**插件清单 / 加载器 / 权限 / 沙箱，内置能力插件化** | 杀掉进程后状态能解释清楚；同一个审批不会被用两次；状态不明的副作用不会自动重试 |
-| **P2 远程控制** | 设备配对 + 最小 Web 控制台：Bot 名单、聊天、审批、事件续传、撤销设备 | 断线重连、多设备抢着审批、过期审批、设备被撤销等场景测试通过 |
+| **P2 远程控制** ✅ 2026-11-01（docs/p2-notes.md；Tailscale HTTPS 待接入） | 设备配对 + 最小 Web 控制台：Bot 名单、聊天、审批、事件续传、撤销设备 | 断线重连、多设备抢着审批、过期审批、设备被撤销等场景测试通过 |
 | **P3 协作 + 浏览器** | Hub 异步委派、Chief of Staff、Group 群聊；browser MCP + 每 Bot 独立 profile | 用真实任务（比如"研究 Bot 查资料 → 写作 Bot 出稿"）跑通，并记录失败率、人工介入次数和费用 |
 | **P4 扩展** | Routine/webhook；Codex Driver；Skill；通用桌面 + 租约 + 接管 | 去重、补跑、配额、租约竞争测试通过 |
 | **P5 手机 App** | Expo App、推送、relay（按需） | 后台通知、丢失手机后的恢复流程验证通过 |

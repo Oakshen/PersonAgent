@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS bot_plugins (
   bot_id TEXT NOT NULL REFERENCES bots(id), plugin_id TEXT NOT NULL REFERENCES plugins(id),
   granted TEXT NOT NULL, enabled_at TEXT NOT NULL, PRIMARY KEY (bot_id, plugin_id)
 );
+CREATE TABLE IF NOT EXISTS pairings (
+  code_hash TEXT PRIMARY KEY, name TEXT NOT NULL, scopes TEXT NOT NULL, expires_at TEXT NOT NULL,
+  used_at TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS devices (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, public_key TEXT NOT NULL, scopes TEXT NOT NULL,
+  created_at TEXT NOT NULL, last_seen_at TEXT, revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS device_sessions (
+  token_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id), expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_bot ON events(bot_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, status);
 CREATE INDEX IF NOT EXISTS idx_runs_thread ON runs(thread_id, status);
 CREATE INDEX IF NOT EXISTS idx_actions_run ON actions(run_id, tool_use_id);

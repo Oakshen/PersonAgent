@@ -65,8 +65,9 @@ function brief(input: unknown): string {
   return s.length > 120 ? s.slice(0, 120) + '…' : s;
 }
 
-async function chat(botName: string, text: string, opts: { newThread: boolean }) {
-  const { threadId, messageId, seq } = await call('POST', `/bots/${botName}/messages`, { text, newThread: opts.newThread });
+async function chat(botName: string, text: string, opts: { newThread: boolean; interrupt: boolean }) {
+  const { threadId, messageId, seq, interrupted } = await call('POST', `/bots/${encodeURIComponent(botName)}/messages`, { text, newThread: opts.newThread, interrupt: opts.interrupt });
+  if (interrupted) console.log(dim(`  已打断 ${interrupted}，新消息排在它后面`));
   const tty = process.stdin.isTTY;
   let myRun: string | null = null;
   await follow(`thread=${threadId}&after=${seq}`, async (e) => {
@@ -168,7 +169,7 @@ const USAGE = `用法：
   pagent bot policy <name> '<规则 JSON 数组>'
   pagent bot set <name> [--max-turns N] [--daily-turns N] [--max-seconds N] [--max-actions N]
   pagent backup
-  pagent chat <bot> [--new] <消息…>
+  pagent chat <bot> [--new] [--interrupt] <消息…>
   pagent approvals | pagent approve <id> | pagent deny <id>
   pagent runs [bot] | pagent run <runId> | pagent interrupt <runId>
   pagent events [--after N] [-f]
@@ -188,23 +189,44 @@ async function main(argv: string[]) {
         return console.log(`已创建 ${b.name}（${b.id}）`);
       }
       if (sub === 'ls') return table(await call('GET', '/bots'), ['name', 'id', 'model', 'maxTurns', 'createdAt']);
-      if (sub === 'show') return console.log(JSON.stringify(await call('GET', `/bots/${name}`), null, 2));
+      if (sub === 'show') return console.log(JSON.stringify(await call('GET', `/bots/${encodeURIComponent(name)}`), null, 2));
       if (sub === 'set') {
         const num = (f: string) => { const v = flag(rest, f); return v === undefined ? undefined : Number(v); };
-        const b = await call('PATCH', `/bots/${name}`, {
+        const b = await call('PATCH', `/bots/${encodeURIComponent(name)}`, {
           maxTurns: num('--max-turns'), dailyTurnBudget: num('--daily-turns'),
           maxRunSeconds: num('--max-seconds'), maxActions: num('--max-actions'),
         });
         return console.log(`${b.name}：maxTurns=${b.maxTurns} dailyTurnBudget=${b.dailyTurnBudget} maxRunSeconds=${b.maxRunSeconds} maxActions=${b.maxActions}`);
       }
-      if (sub === 'policy') return console.log(JSON.stringify((await call('PATCH', `/bots/${name}`, { policy: JSON.parse(rest[0]) })).policy, null, 2));
+      if (sub === 'policy') return console.log(JSON.stringify((await call('PATCH', `/bots/${encodeURIComponent(name)}`, { policy: JSON.parse(rest[0]) })).policy, null, 2));
       break;
     }
     case 'chat': {
       const newThread = args.includes('--new');
-      const [bot, ...words] = args.filter((a) => a !== '--new');
+      const interrupt = args.includes('--interrupt');
+      const [bot, ...words] = args.filter((a) => a !== '--new' && a !== '--interrupt');
       if (!bot || !words.length) break;
-      return chat(bot, words.join(' '), { newThread });
+      return chat(bot, words.join(' '), { newThread, interrupt });
+    }
+    case 'action': {
+      const [sub, id, outcome, ...note] = args;
+      if (sub !== 'resolve' || !id || !outcome) break;
+      await call('POST', `/actions/${id}/resolve`, { outcome, note: note.join(' ') || undefined });
+      return console.log('已核对');
+    }
+    case 'device': {
+      const [sub, a1, ...rest] = args;
+      if (sub === 'pair' && a1) {
+        const scopes = (flag(rest, '--scopes') ?? 'chat,approve,admin').split(',');
+        const p = await call('POST', '/devices/pair', { name: a1, scopes });
+        const base = process.env.PAGENT_REMOTE_URL ?? 'http://localhost:7780';
+        console.log(`配对码：${p.code.replace(/(.{5})/, '$1-')}（${scopes.join(', ')}，${p.expiresAt} 前有效，只能用一次）`);
+        console.log(`在设备上打开 ${base}/#pair=${p.code} ，或打开 ${base} 后手动输入配对码`);
+        return;
+      }
+      if (sub === 'ls') return table(await call('GET', '/devices'), ['id', 'name', 'scopes', 'created_at', 'last_seen_at', 'revoked_at']);
+      if (sub === 'revoke' && a1) return console.log((await call('POST', `/devices/${a1}/revoke`)).ok ? '已撤销，该设备的会话和事件流已断开' : '设备不存在或已撤销');
+      break;
     }
     case 'backup':
       return console.log(`已备份到 ${(await call('POST', '/backup')).file}`);
@@ -215,7 +237,7 @@ async function main(argv: string[]) {
       await call('POST', `/approvals/${args[0]}`, { decision: cmd, by: 'cli' });
       return console.log(cmd === 'approve' ? '已批准' : '已拒绝');
     case 'runs':
-      return table(await call('GET', `/runs${args[0] ? `?bot=${args[0]}` : ''}`), ['id', 'status', 'num_turns', 'cost_usd', 'started_at', 'error']);
+      return table(await call('GET', `/runs${args[0] ? `?bot=${encodeURIComponent(args[0])}` : ''}`), ['id', 'status', 'num_turns', 'cost_usd', 'started_at', 'error']);
     case 'run': {
       const r = await call('GET', `/runs/${args[0]}`);
       console.log(`${r.id}  ${r.status}  turns=${r.num_turns}  ${r.error ?? ''}`);
@@ -233,13 +255,13 @@ async function main(argv: string[]) {
       }
       if (sub === 'ls') return table((await call('GET', '/plugins')).map((p: any) => ({ ...p, hash: p.hash.slice(0, 12) })), ['id', 'version', 'hash', 'installedAt']);
       if (sub === 'show') return console.log(JSON.stringify(await call('GET', `/plugins/${a1}`), null, 2));
-      if (sub === 'bot') return table(await call('GET', `/bots/${a1}/plugins`), ['id', 'version', 'status', 'enabledAt']);
-      if (sub === 'disable') return console.log((await call('DELETE', `/bots/${a1}/plugins/${a2}`)).ok ? '已停用' : '本来就没启用');
+      if (sub === 'bot') return table(await call('GET', `/bots/${encodeURIComponent(a1)}/plugins`), ['id', 'version', 'status', 'enabledAt']);
+      if (sub === 'disable') return console.log((await call('DELETE', `/bots/${encodeURIComponent(a1)}/plugins/${a2}`)).ok ? '已停用' : '本来就没启用');
       if (sub === 'enable') {
         const p = await call('GET', `/plugins/${a2}`);
         console.log(`给 ${a1} 启用 ${p.id}@${p.version}，它会获得以下权限：\n${describePermissions(p.manifest)}`);
         if (!args.includes('--yes') && !(await confirm('同意并启用？[y/N] '))) return console.log('已取消');
-        await call('POST', `/bots/${a1}/plugins`, { id: a2 });
+        await call('POST', `/bots/${encodeURIComponent(a1)}/plugins`, { id: a2 });
         return console.log('已启用');
       }
       break;

@@ -45,6 +45,11 @@ services:
       PAGENT_WORKER_USER: "${PAGENT_UID}:${PAGENT_UID}"
       PAGENT_HOST_CRED: ${PAGENT_HOST_CRED:-}
       PAGENT_WORKER_ALLOW: api.anthropic.com:443,platform.claude.com:443,console.anthropic.com:443,claude.ai:443
+      PAGENT_WEB_DIR: ${PAGENT_SRC}/packages/web
+    # 远程入口只发布到宿主回环地址；手机经 tailscale serve（HTTPS）访问
+    ports:
+      - "127.0.0.1:${PAGENT_REMOTE_PORT:-7780}:7780"
     networks:
       sandbox:
         aliases: [pagentd]
+      outside: {}

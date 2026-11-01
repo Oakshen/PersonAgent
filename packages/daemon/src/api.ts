@@ -7,13 +7,13 @@ import { randomBytes } from 'node:crypto';
 import { config } from './config.ts';
 import { type BotPluginRow, type PluginRow, PluginError, disable, enable, install } from './plugins.ts';
 import { canonicalPermissions } from '../../protocol/src/plugin.ts';
-import { type ActionRow, type ApprovalRow, type BotRow, type RunRow, type Store, type ThreadRow, bus, newId, now } from './store.ts';
+import { type ActionRow, type ApprovalRow, type BotRow, type RunRow, type Store, newId, now } from './store.ts';
+import { ServiceError, createBot, decideApproval, reconcileAction, sendMessage, streamEvents } from './service.ts';
+import { type Devices, DeviceError, type Scope } from './devices.ts';
 import { readBody, send } from './hooks.ts';
 import type { Runner } from './runner.ts';
 import type { Approvals } from './approvals.ts';
-import type { Bot, PagentEvent, PolicyRule } from '../../protocol/src/types.ts';
-
-const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+import type { Bot, PolicyRule } from '../../protocol/src/types.ts';
 
 export const toBot = (r: BotRow): Bot => ({
   id: r.id, name: r.name, persona: r.persona, model: r.model,
@@ -32,7 +32,7 @@ class HttpError extends Error {
   constructor(code: number, message: string) { super(message); this.code = code; }
 }
 
-export function startApi(store: Store, runner: Runner, approvals: Approvals, sock: string): http.Server {
+export function startApi(store: Store, runner: Runner, approvals: Approvals, devices: Devices, sock: string): http.Server {
   const botByName = (name: string) => {
     const b = store.get<BotRow>('SELECT * FROM bots WHERE name = ?', name);
     if (!b) throw new HttpError(404, `没有名为 ${name} 的 Bot`);
@@ -41,17 +41,7 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
 
   const routes: [string, RegExp, (m: RegExpMatchArray, body: any, url: URL, res: http.ServerResponse) => unknown][] = [
     ['GET', /^\/bots$/, () => store.all<BotRow>('SELECT * FROM bots ORDER BY created_at').map(toBot)],
-    ['POST', /^\/bots$/, (_m, b) => {
-      if (!NAME_RE.test(b?.name ?? '')) throw new HttpError(400, 'name 只能用小写字母、数字和 -');
-      if (store.get('SELECT 1 FROM bots WHERE name = ?', b.name)) throw new HttpError(409, `${b.name} 已存在`);
-      const id = newId('bot');
-      store.tx(() => {
-        store.run('INSERT INTO bots(id, name, persona, model, policy, max_turns, created_at) VALUES (?,?,?,?,?,?,?)',
-          id, b.name, b.persona ?? '', b.model ?? null, JSON.stringify(b.policy ?? []), b.maxTurns ?? 30, now());
-        store.emit('bot.created', { name: b.name }, { botId: id });
-      });
-      return toBot(store.get<BotRow>('SELECT * FROM bots WHERE id = ?', id)!);
-    }],
+    ['POST', /^\/bots$/, (_m, b) => toBot(createBot(store, b ?? {}))],
     ['GET', /^\/bots\/([^/]+)$/, (m) => toBot(botByName(m[1]))],
     ['PATCH', /^\/bots\/([^/]+)$/, (m, b) => {
       const bot = botByName(m[1]);
@@ -65,18 +55,8 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
         posInt(b.maxActions, 'maxActions') ?? bot.max_actions, bot.id);
       return toBot(store.get<BotRow>('SELECT * FROM bots WHERE id = ?', bot.id)!);
     }],
-    ['POST', /^\/bots\/([^/]+)\/messages$/, (m, b) => {
-      const bot = botByName(m[1]);
-      if (!b?.text) throw new HttpError(400, '缺少 text');
-      let thread = b.newThread ? undefined
-        : store.get<ThreadRow>('SELECT * FROM threads WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1', bot.id);
-      if (!thread) {
-        const id = newId('thr');
-        store.run('INSERT INTO threads(id, bot_id, created_at) VALUES (?,?,?)', id, bot.id, now());
-        thread = store.get<ThreadRow>('SELECT * FROM threads WHERE id = ?', id)!;
-      }
-      return { threadId: thread.id, ...runner.enqueue(thread.id, b.text) };
-    }],
+    ['POST', /^\/bots\/([^/]+)\/messages$/, (m, b) =>
+      sendMessage(store, runner, m[1], b?.text, { newThread: b?.newThread, interrupt: b?.interrupt })],
     ['GET', /^\/runs$/, (_m, _b, url) => {
       const bot = url.searchParams.get('bot');
       const limit = Number(url.searchParams.get('limit') ?? 20);
@@ -97,14 +77,11 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
     ['POST', /^\/runs\/([^/]+)\/interrupt$/, (m) => ({ ok: runner.interrupt(m[1]) })],
     ['GET', /^\/approvals$/, (_m, _b, url) =>
       store.all<ApprovalRow>('SELECT * FROM approvals WHERE status = ? ORDER BY created_at', url.searchParams.get('status') ?? 'pending')],
-    ['POST', /^\/approvals\/([^/]+)$/, (m, b) => {
-      const status = b?.decision === 'approve' ? 'approved' : b?.decision === 'deny' ? 'denied' : null;
-      if (!status) throw new HttpError(400, 'decision 必须是 approve 或 deny');
-      const r = approvals.settle(m[1], status, b.by ?? 'cli');
-      if (!r.current) throw new HttpError(404, '审批不存在');
-      if (!r.ok) throw new HttpError(409, `审批已是 ${r.current} 状态，不能再改`);
-      return { ok: true, status };
-    }],
+    ['POST', /^\/approvals\/([^/]+)$/, (m, b) => decideApproval(approvals, m[1], b?.decision, b?.by ?? 'cli')],
+    ['POST', /^\/actions\/([^/]+)\/resolve$/, (m, b) => reconcileAction(store, m[1], b?.outcome, 'cli', b?.note)],
+    ['POST', /^\/devices\/pair$/, (_m, b) => devices.createPairing(b?.name, (b?.scopes ?? ['chat', 'approve', 'admin']) as Scope[])],
+    ['GET', /^\/devices$/, () => devices.list()],
+    ['POST', /^\/devices\/([^/]+)\/revoke$/, (m) => ({ ok: devices.revoke(m[1]) })],
     ['GET', /^\/plugins$/, () => store.all<PluginRow>('SELECT * FROM plugins ORDER BY id').map(toPlugin)],
     ['GET', /^\/plugins\/([^/]+)$/, (m) => {
       const p = store.get<PluginRow>('SELECT * FROM plugins WHERE id = ?', m[1]);
@@ -156,14 +133,23 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
       for (const old of readdirSync(dir).filter((f) => f.endsWith('.db')).sort().slice(0, -10)) rmSync(join(dir, old));
       return { file };
     }],
-    ['GET', /^\/events$/, (_m, _b, url, res) => streamEvents(store, url, res)],
+    ['GET', /^\/events$/, (_m, _b, url, res) => {
+      const after = Number(url.searchParams.get('after') ?? 0);
+      const filter = { threadId: url.searchParams.get('thread'), runId: url.searchParams.get('run'), botId: url.searchParams.get('bot') };
+      if (url.searchParams.get('follow') !== '1') {
+        return store.eventsAfter(after, 1000).filter((e) =>
+          (!filter.threadId || e.threadId === filter.threadId) && (!filter.runId || e.runId === filter.runId) && (!filter.botId || e.botId === filter.botId));
+      }
+      streamEvents(store, res, after, filter);
+      return STREAMING;
+    }],
   ];
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://pagent');
     try {
       for (const [method, re, fn] of routes) {
-        const m = url.pathname.match(re);
+        const m = decodeURIComponent(url.pathname).match(re);
         if (!m || method !== req.method) continue;
         const raw = req.method === 'GET' || req.method === 'DELETE' ? '' : await readBody(req, 20 * 1024 * 1024);
         const out = fn(m, raw ? JSON.parse(raw) : undefined, url, res);
@@ -172,7 +158,7 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
       }
       send(res, 404, { error: 'not found' });
     } catch (e) {
-      const code = e instanceof HttpError ? e.code : 500;
+      const code = e instanceof HttpError ? e.code : e instanceof ServiceError || e instanceof DeviceError ? e.status : 500;
       if (code === 500) console.error(e);
       send(res, code, { error: (e as Error).message });
     }
@@ -188,30 +174,3 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
 const STREAMING = Symbol('streaming');
 
 const toPlugin = (p: PluginRow) => ({ id: p.id, version: p.version, hash: p.hash, installedAt: p.installed_at, manifest: JSON.parse(p.manifest) });
-
-/** 事件流：after 游标续传；follow=1 时以 SSE 持续推送。客户端断线重连带上最后的 seq 即可不重不漏。 */
-function streamEvents(store: Store, url: URL, res: http.ServerResponse): unknown {
-  const after = Number(url.searchParams.get('after') ?? 0);
-  const filter = {
-    threadId: url.searchParams.get('thread'),
-    runId: url.searchParams.get('run'),
-    botId: url.searchParams.get('bot'),
-  };
-  const match = (e: PagentEvent) =>
-    (!filter.threadId || e.threadId === filter.threadId) && (!filter.runId || e.runId === filter.runId) && (!filter.botId || e.botId === filter.botId);
-  if (url.searchParams.get('follow') !== '1') return store.eventsAfter(after, 1000).filter(match);
-
-  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-  const write = (e: PagentEvent) => { if (match(e)) res.write(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`); };
-  // 回放与订阅在同一个同步片段里完成，中间不会插入新事件
-  let cursor = after;
-  for (let batch = store.eventsAfter(cursor); batch.length; batch = store.eventsAfter(cursor)) {
-    batch.forEach(write);
-    cursor = batch[batch.length - 1].seq;
-  }
-  const onEvent = (e: PagentEvent) => { if (e.seq > cursor) write(e); };
-  bus.on('event', onEvent);
-  const ping = setInterval(() => res.write(': ping\n\n'), 15000);
-  res.on('close', () => { bus.off('event', onEvent); clearInterval(ping); });
-  return STREAMING;
-}

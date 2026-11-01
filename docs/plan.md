@@ -1,225 +1,207 @@
-# PersonAgent 方案 v2
+# PersonAgent 方案 v3
 
-> v1 经 gpt-6-astra 评审，并参考 Grok Bot 官方设计文（x.ai/news/designing-grok-bot）、0.18 客户端逆向（b-nnett/grok-bot-0.18-reconstructed）、OpenClaw / Hermes / Happy Coder 的社区反馈后重写。
+> **v3 的变化（2026-11-01）**：按你的思路重写。
+> 1. **不再有审批**。每个 Agent 绑定一个 Claude Code session，以 bypass 模式运行，直接替你做事。安全边界是 Agent 自己的那台电脑，而不是一次次问你。
+> 2. **记忆成为一等公民**：每个 Agent 有自己的记忆，并且实时更新；整个 PersonAgent 另有一份"关于你"的全局记忆。
+> 3. 参考 Grok Bot 的官方设计和第三方分析，借鉴它做对的地方，避开用户骂得最多的地方。
 >
-> **默认假设（未确认，可改）**：TypeScript + Node LTS；第一版只做**单用户、自有 VPS**，但数据模型按以后产品化设计；"图形化"同时指 agent 操控的远程桌面和人用的 Web 控制台。
+> v2 里的审批、策略引擎、PreToolUse hook、"待核对"这一整套全部移除。P0~P2 的其他部分（控制面、worker 容器、出口代理、中断与崩溃对账、插件、设备认证、Web 控制台）保留。
 
 ## 1. 产品定义
 
-一个人拥有一组常驻在自己 VPS 上的 Bot。每个 Bot 有身份、记忆、定时任务，能干活、能找别的 Bot 协作；人用手机或 Web 指挥、审批、接管。
+**一个 Agent = 一个身份 + 一台属于它的电脑 + 一条连续的会话 + 它自己的记忆。**
 
-借鉴 Grok Bot 的对象模型：
+你在手机或网页上和它说话，它就去做。它有一台自己的电脑：终端、文件、浏览器，以后还有桌面。它在那台电脑上拥有全部权限，不会为每个动作来问你。它记得你们之间的事，也记得关于你的事。多个 Agent 可以分工、互相发消息，也可以由一个"总管"Agent 来协调。
 
 | 对象 | 含义 | 作用域 |
 |---|---|---|
-| **Bot** | 持久角色：persona、Driver、权限、记忆 | — |
-| **Chat** | 和一个 Bot 的对话；**Group** 是多个 Bot 加人的群聊 | Bot / Group |
-| **Skill** | 可复用的指令（prompt 加脚本） | 账号级共享 |
-| **Tool** | MCP 能力、连接器、浏览器、桌面 | 账号级注册，按 Bot 授权 |
-| **Routine** | 定时或事件触发的 Prompt | Bot 级 |
-| **Memory** | 长期记忆 | Bot 级隔离 |
-| **Artifact** | 文档、代码、截图等产出 | 归属于 Run |
+| **Agent** | 名字、印章头像、人设、模型 | — |
+| **会话** | 每个 Agent 只有**一条** Claude Code session，一直 resume 下去；上下文太长时自动压缩 | Agent |
+| **电脑** | 每个 Agent 一个独立容器：终端、文件、浏览器（后续加桌面） | Agent |
+| **Agent 记忆** | 它自己的工作记忆，实时写入 | Agent |
+| **全局记忆** | 关于你这个人：偏好、身份、常用账号、正在做的事 | 所有 Agent 共享 |
+| **Skill / 插件** | 可复用的能力 | 账号级安装，按 Agent 启用 |
+| **Routine** | 定时或事件触发，在该 Agent 的会话里运行 | Agent |
+| **群聊** | 多个 Agent 加你，在同一条时间线上协作 | 群 |
 
-界面原则：侧边栏是 **Bot 名单**，不是聊天历史。头像同时表示状态：空闲 / 工作中 / 等待审批 / 卡住 / 完成。跨 Bot 的协调交给一个 **Chief of Staff Bot**，用户不需要自己调度。
+## 2. 设计原则
 
-## 2. 三条底线（不满足就不发版）
+1. **不打断**。界面上没有审批，也没有"待核对"。Agent 只有在它自己判断需要你时，才会发一张**选择卡**来问（见第 7 节）。这是 Agent 主动提问，不是系统拦截。
+2. **电脑就是边界**。Agent 能做的事，限定在它自己那台电脑之内：
+   - 碰不到宿主机、其他 Agent 的电脑、你家里的局域网。
+   - 它在那台电脑上做什么都可以，大不了重建那台电脑。
+3. **会话连续，记忆独立于会话**。会话可以压缩，也可以重开，但记忆一直都在。这正是 Grok Bot"越聊越笨、只能删了重建"那个问题的解法。
+4. **一切都在时间线上**。消息、执行步骤、Routine 的运行、Agent 之间的消息、记忆的变化，都按顺序出现在同一条时间线里。
+5. **少即是多**。Grok 团队的原话是："As agents take on more responsibility, the interface should ask less of the person."
 
-1. **执行隔离**：daemon 掌握状态和策略；agent 跑在受限的 worker 里。agent 碰不到 daemon 的数据库、策略文件，也碰不到其他 Bot 的目录和凭据。
-2. **审批是授权协议**：批准绑定到具体操作，有过期时间，只能用一次，执行前重新校验。审批进入第一条可用链路，不往后排。
-3. **副作用可恢复**：会话能续上不等于任务能恢复。有副作用的操作单独记账；状态不明时标为 `unknown`，等人核对，绝不盲目重试。
+## 3. 从 Grok Bot 学到的
 
-## 3. 架构
+来源：
+- [官方设计文](https://x.ai/news/designing-grok-bot)
+- [Grok Bot 101](https://x.ai/bot/guides/grok-bot-101)
+- [官方文档：审批与安全](https://docs.x.ai/grok-bot/approvals-security-and-privacy)
+- [DataCamp 教程](https://www.datacamp.com/tutorial/grok-bot-tutorial)
+- [0.18 客户端逆向](https://github.com/b-nnett/grok-bot-0.18-reconstructed)
+- X / Reddit 上的用户反馈（经 grok CLI 汇总）
 
-```
-┌──────────────────────────── VPS ─────────────────────────────┐
-│ 控制面 pagentd（Node, 单进程, SQLite）                         │
-│   身份/配对 · 策略引擎 · Run/Action/Approval 状态机            │
-│   调度(Routine) · 消息总线(Hub) · 预算 · 事件 outbox           │
-│        │ 本地 socket（带 worker 身份）                         │
-│ 执行面 worker（每 Bot 一个容器 / 独立 uid）                    │
-│   官方 CLI：claude / codex（用户自己登录）                     │
-│   注入 MCP：hub · memory · browser · desktop（都回调控制面）    │
-│   网络出口代理：域名白名单，屏蔽云元数据和内网地址              │
-│ 桌面面（可选）：TigerVNC + XFCE + Chrome，每 Bot 一个 display   │
-│   和独立 Chrome profile；noVNC 只经由控制面鉴权后转发           │
-└───────────────────────────────────────────────────────────────┘
-     ▲ Tailscale + 应用层设备认证（WebSocket 加 REST）
-  CLI/TUI · Web 控制台 · 手机 App
-```
-
-要点：
-- **复用现成的 agent 循环**（Claude Code / Codex），不自己写。我们只做编排、策略和状态管理。
-- **MCP 只是能力入口，不是权限边界**。真正的边界由三层组成：worker 容器、出口代理、MCP 调用时控制面的策略检查。限不住的通道（比如原生 shell）通过降低 worker 权限来兜底，不在 UI 上谎称"所有危险操作都会审批"。
-- 控制面要预留资源（cgroup）。worker 被 OOM 杀掉时不能连带控制面。
-
-## 4. Driver 与订阅合规
-
-| Driver | 首版 | 方式 | 认证 |
-|---|---|---|---|
-| `claude-code` | ✅ 唯一完整实现 | 在 worker 里**每轮运行一次未修改的官方 `claude -p`**（`--resume` 续上会话，stream-json 输出），审批走 PreToolUse hook，中断时杀进程组。轮中插话（steer）以后用 Agent SDK 作为可选能力补上（见 p0-findings） | 用户自己的订阅或 API Key，凭据只留在 worker 内 |
-| `codex` | P4 | `codex app-server` | 同上，用来验证抽象是否成立 |
-| 自写 API 循环 | 暂缓 | — | — |
-
-- 合规原则：**我们不收集、不中转用户的订阅令牌**，只负责启动官方客户端。以后要做托管服务或商业化前，按"部署模式 × Driver × 认证方式 × 凭据持有方"重新逐项核对 Anthropic / OpenAI 的条款。
-- Driver 接口要声明能力（capability 协商），不要求每个 Driver 都实现全部能力：
-
-```ts
-interface Driver {
-  capabilities: { resume; interrupt; permissionHook; usage; mcp; compaction };
-  start(run): AsyncIterable<DriverEvent>;   // 统一的最小事件 + 带命名空间的厂商扩展
-  input(runId, msg, mode: 'queue' | 'steer');
-  interrupt(runId): Promise<'requested'>;    // 真正停下以另一个事件为准
-}
-```
-- 不支持跨 Driver 无损 resume。不允许失败后静默切换供应商。
-
-## 5. 数据模型（独立于模型会话）
-
-```
-Bot ─┬─ Thread（Chat/Group；映射 driver session id）
-     ├─ Routine
-     └─ Memory
-Run（一次执行：root_run_id / parent_run_id / 预算 / deadline）
- └─ Action（有副作用的操作：幂等键 / 状态）
-     └─ Approval（approval_id、tool、参数摘要、目标、策略版本、过期时间、是否已用）
-Artifact · Event（全局序号，outbox）
-```
-
-- Run 状态：`queued / running / waiting_approval / waiting_child / succeeded / failed / cancelled / unknown`
-- 每个 Thread 只有一个写入者：CLI、Web、手机、Hub 的输入都经过同一个队列。
-- 记忆分三类：用户确认的事实 / 模型推断 / 系统策略，并记录来源和时间。**模型不能通过写记忆来修改策略**。注入方式借鉴 Grok Bot 的"冻结快照"：同一个压缩周期内 system prompt 前缀逐字不变，以保持 KV cache 命中。
-- 工具返回的大结果写进 workspace 文件，上下文里只放路径。
-
-## 6. Bot 间协作（Hub MCP）
-
-- 首版**只做异步**：`delegate(to, task) → run_id`、`send_message`、`list_agents`（只返回调用方被允许看到的 Bot）、`notify_user`。暂不做同步的 `ask`，避免互相等待造成死锁。
-- 等待子任务时进入 `waiting_child`，**让出执行槽**，子任务完成后再唤醒父任务。
-- 发送者身份由控制面根据 worker 的连接身份来绑定，不信任参数里传的值。
-- 消息正文一律视为**不可信数据**。委派不会扩大权限：接收方即使权限更高，执行的动作也受发起方授权范围的约束，超出范围就要用户审批。
-- 每个根任务都有上限：消息数、子任务数、并发数、时长、预算。
-- Group 群聊：多个 Bot 加人在一个 Thread 里，各自保留自己的记忆，只共享群里的上下文；由 Chief of Staff Bot 负责路由。
-- 交接物通过 Artifact 或共享目录传递（只读挂载），不共享工作记忆。
-
-## 7. 审批
-
-- 由策略引擎决定是 `allow / ask / deny`，决策依据包括工具、参数、目标域名或路径、Bot、发起链路。
-- 审批记录绑定：`run_id、action_id、tool、规范化参数的哈希、目标资源、策略版本、expires_at、used`。
-- 用户批准后，执行前要**重新校验**参数和目标状态，有变化就重新审批。多台设备同时点批准时，只有一次能成功（用 CAS）。超时、断线、重启时一律保持阻断，**绝不自动批准**。
-- 结果区分三种：已阻止 / 已请求取消 / 已产生外部副作用。
-- Claude Code 的接入点：`--permission-prompt-tool` 指向我们的 MCP，加上 PreToolUse hook。凡是经过它的调用都受策略管控。
-
-## 8. 浏览器与桌面
-
-- **优先做结构化浏览器自动化**（基于 CDP 的 browser MCP：读页面结构、点击元素、填表单）。通用桌面只作为兜底。
-- 每个 Bot 有独立的 display 和 **Chrome profile**，下载目录按 Bot 隔离。登录态默认不共享（这一点比 Grok Bot 共用一台云电脑更严格）。
-- 租约：一个 display 同一时间只有一个持有者，用递增的 **fencing token**，执行端拒绝旧 token 的请求；租约同时覆盖 GUI 操作和 CDP。
-- 人工接管：撤销租约 → 清空动作队列 → 等确认停稳；无法取消的在途动作要显式展示出来。交还后，agent 必须重新截图，丢弃旧坐标和旧元素引用。
-- 等待审批时**释放桌面**，避免长期占着屏幕。
-
-## 9. 远程连接与事件
-
-- 网络层走 Tailscale；应用层另做设备认证：配对码短时有效、只能用一次；设备在本地生成密钥对；支持撤销设备、轮换密钥。
-- API、WebSocket、看桌面、控制桌面分别校验权限；WebSocket 校验 Origin；token 不放在 URL 里；CDP、VNC、Driver、MCP 的端口一律不对外。
-- 事件带全局序号。客户端用游标续传，加上状态快照补齐。事件来自事务性 outbox，状态变更和事件写入同一个事务。慢客户端可以丢弃中间预览帧，但**终态和审批事件绝不丢**。
-- Routine：明确时区、错过执行后的补跑策略、上一次未结束时是否允许重叠；webhook 要验签并去重。
-- 推送只起提醒作用，审批状态以服务端为准。
-
-## 10. 预算与资源
-
-- 每个 Bot、每个根任务都设预算。订阅制的 Driver 算不出确切费用，就用轮次、时长、工具调用次数、截图数量来兜底。
-- 委派子任务前，先从父任务的预算里**预留**一部分。
-- 设磁盘水位线、日志轮转、截图保留期限、队列长度上限。
-- 最低配置等压测之后再写。不再拍脑袋写 2C4G。
-
-## 11. 插件系统（从 P1 起就是内核的一部分）
-
-目标是建一个开发者能持续贡献的插件社区。原则有三条：**用现成标准、权限显式声明、隔离运行**。
-
-### 11.1 插件类型
-
-| 类型 | 标准 / 格式 | 例子 |
+| Grok Bot 的做法 | 用户反馈 | 我们怎么做 |
 |---|---|---|
-| **Skill** | Agent Skills（`SKILL.md` + 脚本），与 Claude Code / Codex 生态兼容 | 写周报、PR review 流程 |
-| **Tool** | MCP server（stdio / HTTP） | GitHub、Notion、数据库 |
-| **Connector** | 带 OAuth 的 Tool，凭据由控制面托管，插件拿不到原始 token | Gmail、飞书、Google Calendar |
-| **Channel** | 消息入口适配器 | Telegram、Discord、飞书机器人 |
-| **Trigger** | Routine 的事件源 | RSS、GitHub webhook、邮件到达 |
-| **Bot 模板** | persona + 推荐 Skill/Tool + 默认 Routine 的打包 | "研究员""运维值班" |
-| **UI 面板**（P5） | 在手机端和 Web 中声明式渲染的卡片 / 小组件 | 股票看板、日程卡片 |
+| 侧边栏是 Bot 名单，不是聊天历史；头像同时表示状态 | 好评 | 照做（已实现：印章头像加状态点） |
+| 一个 Bot 就是一条长会话 | 越聊越贵、越笨；94% 的 token 花在重读历史上；没有"清空上下文"按钮，只能删掉 Bot 重建 | 一个 Agent 一条 session，靠 Claude Code 自动压缩。另外提供**"新会话"**：清空上下文，但保留身份和全部记忆 |
+| **Auto Review 默认开启**：一个审查模型检查每个动作，付款、发消息、删除都要你点头 | 抱怨最多的一条：设了"始终允许"还是会问；审批卡约 10 分钟过期，人睡着时一夜卡住；一件小事要批三次 | **不做审批**。在隔离的电脑里用 bypass 模式运行 |
+| 账号下所有 Bot **共用一台云电脑**，登录态和文件互通 | 文档自己承认"不要把不同 Bot 当安全边界"；删了 Bot 也清不掉它留下的东西 | **每个 Agent 一台电脑**，彼此隔离。确实需要共用的账号，以后用"保险箱"显式授权 |
+| 电脑分三档：状态 / 预览 / 接管；遇到验证码、二步验证时交给你 | 好评，是它和普通聊天最大的差别 | 照做（P4） |
+| Bot 主动发选择卡，比如邮件草稿带"发送 / 丢弃" | 好评 | Agent 可调用 `ask_user` 工具发选择卡；它自己决定什么时候问 |
+| 记忆分账号级和 Bot 级；system prompt 在同一压缩周期内冻结，以保持缓存命中 | 用户反映会忘记已经定好的事；"规则别埋在三周前的聊天里" | **两层记忆，实时写入**（第 5 节），并且在界面上看得见、改得了 |
+| 云电脑的出口是机房 IP | 常被 Reddit 等网站拒绝 | 自托管：出口可以选你家里的线路 |
+| 写代码交给 Cursor 云端 agent | 好评 | 我们的 Agent 本身就是 Claude Code / Codex |
 
-**自举**：hub / memory / browser / desktop 这些内置能力本身也按插件格式实现。插件 API 我们自己天天用，才能保证好用。
-
-### 11.2 清单（`pagent-plugin.json`）
-
-```json
-{
-  "id": "dev.example.github",
-  "version": "1.2.0",
-  "engines": { "pagent": "^1.0" },
-  "contributes": { "tools": "mcp/server.js", "skills": ["skills/*"] },
-  "permissions": {
-    "network": ["api.github.com"],
-    "secrets": ["github.oauth"],
-    "fs": "plugin-data",
-    "actions": { "create_issue": "ask", "list_repos": "allow" }
-  }
-}
-```
-
-- 用户安装时看到权限清单，可以逐项授权，再按 Bot 启用（Tool 是账号级注册，按 Bot 授权，和第 1 节一致）。
-- 插件升级时如果**权限扩大，必须重新同意**；权限不变的补丁版本可以自动更新（可在设置里关掉）。
-- `actions` 给每个工具一个默认的审批级别，最终以用户策略为准，插件只能建议，不能放宽。
-
-### 11.3 隔离运行
-
-- 每个插件跑在自己的沙箱进程里（容器 / 独立 uid），只能访问 `permissions.network` 声明的域名（经出口代理强制执行），只能读写自己的数据目录。
-- Connector 的 OAuth token 由控制面持有，插件只能请求"带凭据代发请求"，不接触 token 本身。
-- 插件的输出一律视为**不可信内容**进入上下文。这是为了防"插件串联"攻击：清华的 KnotScryer 证明了，不用改插件本身，只靠插件读到的第三方内容就能把几个看起来干净的插件串起来泄密，OpenClaw、Hermes、OpenCode 都中招了。
-- **禁止**安装时执行脚本。依赖必须打包在插件内或在清单里声明，不允许 README 让用户手动装"前置依赖"，ClawHavoc 就是靠这一招传播的。
-
-### 11.4 社区与分发（P4 起）
-
-- **Registry**：起步先用 Git 仓库索引 + 构建产物（类似 Homebrew tap），社区跑起来后再做网站。
-- **发布流程**：开发者签名 → CI 静态扫描 + 权限 diff → 自动测试 → 上架。高权限插件（shell、全网络、桌面）需要人工审核。
-- **信任分级**：官方 / 认证开发者 / 社区 / 本地侧载，在 UI 上明确标出。
-- **安装**：锁定版本 + 哈希，可回滚；支持私有 registry 和本地目录（`pagent plugin link ./my-plugin`），方便开发调试。
-- **生态兼容**：能直接导入现有的 MCP server 和 Agent Skills（自动生成一份保守的权限清单，由用户确认），开发者第一天就有存量可用。
-- **开发者体验**：`pagent plugin init` 生成脚手架，本地热重载，提供测试工具包（模拟 Bot 调用并检查权限）。
-- **收入分成 / 付费插件**：先不做，等社区规模起来了再说。
-
-### 11.5 对阶段的影响
-
-- P1：插件清单、加载器、权限模型、沙箱运行，内置能力全部用插件格式实现。
-- P3：支持导入 MCP / Agent Skills；`pagent plugin init/link`。
-- P4：Registry、签名、扫描、信任分级、升级时的权限 diff。
-- P5：UI 面板类插件。
-
-## 12. 技术栈与仓库
-
-- Node LTS + TypeScript，pnpm monorepo；SQLite（WAL 模式，所有写入经由控制面）；worker 用 Docker（禁止 privileged，不挂载 docker.sock）。
+## 4. 架构
 
 ```
-packages/
-  protocol/     事件 / API 类型（手机端共用）
-  daemon/       控制面：状态机、策略、调度、Hub、outbox
-  worker/       worker 入口 + Driver 适配器
-  plugin-sdk/   插件清单 schema、加载器、开发工具
-  plugins/      内置插件：hub / memory / browser / desktop
-  cli/          pagent CLI + TUI（Ink）
-  web/          Web 控制台
-deploy/
-  control.Dockerfile  worker.Dockerfile  desktop.Dockerfile  compose.yaml
+手机 App / Web 控制台 / CLI
+        │  设备认证（P2 已完成）
+        ▼
+pagentd（控制面，SQLite）
+  ├─ Agent / 会话 / 运行记录 / 事件时间线（续传）
+  ├─ 记忆服务：全局记忆的唯一写入者；Agent 记忆的索引与展示
+  ├─ 调度：Routine、Agent 之间的消息
+  └─ docker.sock → 每个 Agent 一台电脑
+        ▼
+pagent-agent-<id>（每个 Agent 一个容器，常驻）
+  ├─ 每轮：claude -p --resume <这个 Agent 唯一的 session> --permission-mode bypassPermissions
+  ├─ /home/agent：它自己的家，包括 Claude Code 配置、会话、它自己的记忆（可写）
+  ├─ /work：工作区
+  ├─ /memory/global.md：全局记忆（只读挂载，改要经过工具）
+  └─ 注入的 MCP：pagent（记忆、选择卡、发消息给别的 Agent、通知你）＋ 已启用的插件
+egress 出口代理：默认放行公网，挡住局域网（192.168/16、10/8、172.16/12）和元数据地址
+  └─ 先解析域名、再检查目标 IP，防止借 DNS 把请求绕进内网；以后可选"走家里线路"
 ```
+
+**已经做好、继续沿用的**：
+- 控制面和 worker 分离
+- 容器隔离：非 root、无特权、只读根文件系统、内存和进程数限制
+- 中断：对整个进程组发信号，没停就 SIGKILL
+- 崩溃对账：pagentd 被杀后重启，能对上账并清理残留进程
+- 事件 outbox 和断线续传
+- 插件沙箱：每个插件只能访问自己声明过的站点
+- 设备配对与撤销
+- Web 控制台
+
+**要删掉的**：
+- 审批、策略引擎、PreToolUse hook、managed settings 里的 hook
+- 待核对界面、`approve` 权限
+- 插件清单里的 `actions` 字段
+
+## 5. 记忆（重点）
+
+### 5.1 两层
+
+| | **Agent 记忆** | **全局记忆（关于你）** |
+|---|---|---|
+| 存什么 | 这个 Agent 的工作知识：负责的事、做过的决定、你对它的纠正、它的工作方法 | 关于你这个人：称呼、偏好、常用账号和设备、家庭和工作背景、正在推进的大事 |
+| 谁能读 | 只有这个 Agent | 所有 Agent |
+| 谁能写 | 这个 Agent 自己，可以直接改文件 | 任何 Agent 通过 `remember(scope: "global")` 工具写，由 pagentd 串行写入并记录来源 |
+| 放在哪 | 它自己家里的 `~/.claude/memory/`：一个 `MEMORY.md` 索引，加按主题分的文件 | 控制面数据库，渲染成 `global.md`，只读挂载进每个 Agent |
+| 你怎么管 | 在 Agent 的"它记得什么"面板里查看、编辑、删除 | 在"关于我"页面查看、编辑、删除；每条都显示是哪个 Agent、在哪次对话里写的 |
+
+### 5.2 "实时"是怎么做到的
+
+- **写入**：
+  - 每个 Agent 的系统提示里都有一段固定说明：学到长期有用的事时，**当场**写进记忆，不要等到这一轮结束。比如你纠正了它、做了一个决定、告诉它一个偏好。
+  - 关于你本人的事写进全局记忆，关于它自己工作的事写进它自己的记忆。
+  - 这和 Claude Code 自带的 auto-memory 机制一致，Agent 用文件工具直接写就行。
+- **生效**：每一轮都是一个新的 `claude -p` 进程，启动时会重新加载 `CLAUDE.md`，通过 `@` 引用把 `global.md` 和 `MEMORY.md` 带进来。所以：
+  - Agent A 在第 N 轮写进全局记忆的内容，Agent B 下一次开口时就能看到；
+  - 正在运行的那一轮不会中途改变上下文。
+- **广播**：每次记忆变化都发一条 `memory.updated` 事件，内容包括哪个 Agent、写了什么。它会出现在时间线上，网页也会实时刷新记忆面板。
+- **代价**：记忆一变，下一轮的提示词前缀就会变，那一轮的缓存会失效一次。Grok 为了省钱选择冻结记忆，我们选择实时。好在记忆变化频率远低于对话轮数，成本可以接受；如果以后要省，可以改成"每隔 N 轮刷新一次"。
+
+### 5.3 记忆不随会话丢失
+
+- **自动压缩**：Claude Code 在上下文快满时自动压缩。压缩前，Agent 已经把重要的东西写进记忆了（见 5.2），所以压缩丢掉的只是过程细节。
+- **"新会话"**（你在界面上点，或者 Agent 自己判断）：开一条新的 Claude Code session，旧的归档。身份、人设、两层记忆全部保留。这就是 Grok 用户自己摸索出来的"换血"做法，我们把它做成一个正式功能。
+- 一个 Agent 同一时刻只有一条活跃 session，这一点不变。
+
+### 5.4 记忆的质量
+
+- **整理**：一个夜间 Routine（可关）定期整理两层记忆：合并重复、删掉过时的内容、修正互相矛盾的条目。
+- **不进记忆的东西**：密码、token、密钥。凭据以后单独放进保险箱。
+- **全局记忆的单条大小和总量都有上限**，超出时提示整理，避免每一轮都背一大段。
+
+## 6. 执行模型
+
+- 每轮执行一次 `claude -p --resume <session> --permission-mode bypassPermissions --strict-mcp-config --mcp-config <pagent + 已启用插件>`。
+- **工具调用记录直接从输出流里取**，用来显示执行步骤、做活动日志、计算预算。不再经过 hook，所以每次工具调用也省掉启动一个 node 进程的开销。
+- **中断**：网页上的"停止"按钮，或者"打断并发送"。实现方式不变，仍然是对整个进程组发信号。
+- **崩溃对账**：还在后台照常做，但只写进日志，不再弹出任何东西给你。如果某次执行结果不明，会在时间线上留一条说明，下一轮 Agent 自己能看到。
+- **预算**：每个 Agent 每天的轮次上限、每轮最长时长、每轮最多调用多少次工具，三项都保留。超出就停，并在时间线上说明原因。
+
+## 7. Agent 主动提问（选择卡）
+
+注入 MCP 工具 `ask_user(question, options[], allowCustom)`：
+- Agent 调用后，网页上出现一张选择卡（就是你截图里那种），然后**这一轮结束**，不会阻塞等你。
+- 你点了某个选项，就相当于发出了下一条消息，Agent 接着做。
+- 什么时候该问，完全由 Agent 判断。人设里可以写你自己的红线，比如"花钱前先问我"。系统不强加任何规则。
+
+## 8. Agent 的电脑（P4）
+
+- **现在**：容器里有终端和文件。
+- **加上浏览器**：每个 Agent 一个持久的 Chrome profile，登录一次就一直保持登录。以浏览器 MCP 为主要操作方式，截图和点击作为补充。
+- **加上桌面**：Xvfb 加 noVNC。照 Grok 的三档来做：
+  - **状态**：头像显示"正在用电脑"。
+  - **预览**：对话旁边一个小窗，实时看它的画面。
+  - **接管**：遇到验证码、二步验证时，Agent 调用 `ask_user` 请你接管。你在手机或网页上全屏操作完，再交还给它。
+- **出口**：默认走 claude-2 的网络。每个 Agent 都可以改成走你家里的线路（`.254` 美国住宅 IP），这样不容易被网站当成机房流量拦掉。
+
+## 9. Routine（P5）
+
+- 触发方式：定时（cron）、webhook，以后加邮件、RSS、GitHub 等。
+- Routine 在**该 Agent 自己的会话里**运行，结果出现在时间线上，用标签标出"由 Routine 触发"。
+- Agent 可以在对话里自己创建 Routine，比如你说"每天早上 8 点整理盘前要闻"。
+- 没有新内容就不打扰你。要通知时走推送。
+
+## 10. Agent 之间协作（P6）
+
+- MCP 工具：`list_agents`、`message_agent(name, text)`（异步，对方下一轮处理）、`notify_user`。
+- 发送者身份由控制面绑定，Agent 没法冒充别人。消息正文对接收方来说只是普通输入，不带任何额外权限。
+- **群聊**：一条共享的时间线，每个 Agent 仍然只用自己的记忆。推荐用一个"总管"Agent 来路由。
+- **环路保护**：限制转发深度和每天的消息条数。
+
+## 11. 插件
+
+P1b 的设计保留，并做两处简化：
+- 删掉 `actions`（建议的审批级别）。
+- 插件仍然只能访问它声明过的出网目标。插件是第三方代码，信任级别不同于你自己的 Agent。
+
+## 12. 客户端
+
+- **Web 控制台**（已完成，P2 的"印章与工单"风格）：删掉工单和待处理页，新增几样东西：
+  - 选择卡
+  - "它记得什么"面板
+  - "关于我"页面
+  - "新会话"按钮
+- **手机访问**：先用 Tailscale serve 提供 HTTPS，在手机浏览器里用；以后再做原生 App，带推送。
 
 ## 13. 阶段
 
-| 阶段 | 范围 | 验收 |
+| 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P0 前提验证** ✅ 2026-11-01（docs/p0-findings.md） | 在 worker 容器里跑官方 `claude` 并登录；验证 stream-json、resume、interrupt、permission-prompt-tool、出口代理；验证一个 MCP 插件能在独立沙箱里经代理运行 | 写出一页结论：能控住什么、控不住什么、中断和恢复各是什么表现 |
-| **P1 单 Bot 闭环** ✅ 2026-11-01（docs/p1-notes.md） | daemon + CLI；Bot 增删改查；Thread 队列；Run/Action/Approval 状态机；策略引擎；预算；事件 outbox；备份；**插件清单 / 加载器 / 权限 / 沙箱，内置能力插件化** | 杀掉进程后状态能解释清楚；同一个审批不会被用两次；状态不明的副作用不会自动重试 |
-| **P2 远程控制** ✅ 2026-11-01（docs/p2-notes.md；Tailscale HTTPS 待接入） | 设备配对 + 最小 Web 控制台：Bot 名单、聊天、审批、事件续传、撤销设备 | 断线重连、多设备抢着审批、过期审批、设备被撤销等场景测试通过 |
-| **P3 协作 + 浏览器** | Hub 异步委派、Chief of Staff、Group 群聊；browser MCP + 每 Bot 独立 profile | 用真实任务（比如"研究 Bot 查资料 → 写作 Bot 出稿"）跑通，并记录失败率、人工介入次数和费用 |
-| **P4 扩展** | Routine/webhook；Codex Driver；Skill；通用桌面 + 租约 + 接管 | 去重、补跑、配额、租约竞争测试通过 |
-| **P5 手机 App** | Expo App、推送、relay（按需） | 后台通知、丢失手机后的恢复流程验证通过 |
+| P0~P2 | ✅ 已完成（见 p0-findings、p1-notes、p2-notes） | — |
+| **P3 去审批 + 记忆**（下一步） | 删掉审批、策略、hook；改用 bypass 模式；每个 Agent 一条 session，加"新会话"；出口改为放行公网、挡住局域网；两层记忆，实时写入；`remember` 工具和 `memory.updated` 事件；记忆面板和"关于我"页面；`ask_user` 选择卡 | 聊天中途完全不出现审批；A 记住的事，B 下一轮就知道；点"新会话"后上下文清空，但它仍然记得；Agent 访问不了你的局域网 |
+| P4 Agent 的电脑 | 持久浏览器、桌面、状态 / 预览 / 接管、出口可选家里线路 | 让 Agent 登录一个需要二步验证的网站：你在手机上接管完成验证，交还后它接着做 |
+| P5 Routine 与通知 | 定时和 webhook 触发，在会话里运行；推送通知 | "每天 8 点"的 Routine 连续跑一周，没新内容时不打扰你 |
+| P6 协作 | 发消息给别的 Agent、群聊、总管 Agent | 让总管把一个任务拆给两个 Agent，最后汇总给你 |
+| P7 手机 App | 原生 App、推送、接管 | — |
 
-**发版前必须通过的故障测试**：执行到一半断电、同一个 webhook 重复投递、使用过期审批、恶意网页诱导 Bot 跨 Bot 越权、人工接管时仍有在途点击、浏览器 OOM 或磁盘写满。
+## 14. 已知取舍
+
+- **bypass 加上开放公网**，意味着一个被网页提示注入的 Agent，可能用它自己电脑上的东西去做坏事，比如乱发请求、泄露它工作区里的文件。缓解办法：
+  - 它的电脑只装它需要的东西；
+  - 不同 Agent 之间彼此隔离；
+  - 局域网和宿主机都访问不到；
+  - 凭据以后放进保险箱、按 Agent 授权。
+  
+  这是用"少打断"换来的代价，是我们有意的选择。
+- **订阅凭据**：继续复用宿主机上已经登录的 Claude 订阅，Agent 能读到这份凭据（P0 发现 8）。
+- **实时记忆**会让记忆变化后的那一轮缓存失效一次（见 5.2）。

@@ -166,6 +166,8 @@ const USAGE = `用法：
   pagent bot create <name> [--persona 文本] [--model 模型] [--max-turns N]
   pagent bot ls | pagent bot show <name>
   pagent bot policy <name> '<规则 JSON 数组>'
+  pagent bot set <name> [--max-turns N] [--daily-turns N] [--max-seconds N] [--max-actions N]
+  pagent backup
   pagent chat <bot> [--new] <消息…>
   pagent approvals | pagent approve <id> | pagent deny <id>
   pagent runs [bot] | pagent run <runId> | pagent interrupt <runId>
@@ -187,6 +189,14 @@ async function main(argv: string[]) {
       }
       if (sub === 'ls') return table(await call('GET', '/bots'), ['name', 'id', 'model', 'maxTurns', 'createdAt']);
       if (sub === 'show') return console.log(JSON.stringify(await call('GET', `/bots/${name}`), null, 2));
+      if (sub === 'set') {
+        const num = (f: string) => { const v = flag(rest, f); return v === undefined ? undefined : Number(v); };
+        const b = await call('PATCH', `/bots/${name}`, {
+          maxTurns: num('--max-turns'), dailyTurnBudget: num('--daily-turns'),
+          maxRunSeconds: num('--max-seconds'), maxActions: num('--max-actions'),
+        });
+        return console.log(`${b.name}：maxTurns=${b.maxTurns} dailyTurnBudget=${b.dailyTurnBudget} maxRunSeconds=${b.maxRunSeconds} maxActions=${b.maxActions}`);
+      }
       if (sub === 'policy') return console.log(JSON.stringify((await call('PATCH', `/bots/${name}`, { policy: JSON.parse(rest[0]) })).policy, null, 2));
       break;
     }
@@ -196,6 +206,8 @@ async function main(argv: string[]) {
       if (!bot || !words.length) break;
       return chat(bot, words.join(' '), { newThread });
     }
+    case 'backup':
+      return console.log(`已备份到 ${(await call('POST', '/backup')).file}`);
     case 'approvals':
       return table(await call('GET', '/approvals'), ['id', 'run_id', 'summary', 'expires_at']);
     case 'approve':

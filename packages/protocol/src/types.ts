@@ -19,7 +19,10 @@ export interface Bot {
   persona: string;
   model: string | null;
   policy: PolicyRule[];
-  maxTurns: number;
+  maxTurns: number;          // 单轮 claude 内部最大轮次（--max-turns）
+  dailyTurnBudget: number;   // 每天（UTC）累计轮次上限；订阅模式算不准费用，按轮次限
+  maxRunSeconds: number;     // 单轮最长时长，超时自动中断
+  maxActions: number;        // 单轮工具调用次数上限
   createdAt: string;
 }
 

@@ -60,9 +60,20 @@ export class Runner {
         runId, threadId, bot.id, token, now());
       for (const m of msgs) this.store.run("UPDATE messages SET status = 'consumed', run_id = ? WHERE id = ?", runId, m.id);
       this.store.emit('run.started', { messageIds: msgs.map((m) => m.id) }, { botId: bot.id, threadId, runId });
+      // 每日预算：今天（UTC）已用轮次达到上限就不跑，这一轮直接以 budget_exceeded 结束
+      const used = this.store.get<{ n: number }>(
+        'SELECT coalesce(sum(num_turns), 0) n FROM runs WHERE bot_id = ? AND started_at >= ?',
+        bot.id, new Date().toISOString().slice(0, 10))!.n;
+      if (used >= bot.daily_turn_budget) {
+        const error = `budget_exceeded：今日已用 ${used} 轮，上限 ${bot.daily_turn_budget}`;
+        this.store.run("UPDATE runs SET status = 'failed', ended_at = ?, error = ? WHERE id = ?", now(), error, runId);
+        this.store.emit('run.finished', { status: 'failed', error, unknownActions: 0 }, { botId: bot.id, threadId, runId });
+        return 'skipped' as const;
+      }
       return { runId, token, thread, bot, prompt: msgs.map((m) => m.content).join('\n\n') };
     });
     if (!prep) return;
+    if (prep === 'skipped') return this.kick(threadId);
     const { runId, token, thread, bot, prompt } = prep;
     const entry: Active = { runId };
     this.active.set(threadId, entry);
@@ -108,7 +119,9 @@ export class Runner {
       if (m.type === 'result') result = m;
       else this.onMessage(ref, m);
     });
+    const timer = setTimeout(() => this.interrupt(runId, `timeout：超过单轮上限 ${bot.max_run_seconds} 秒`), bot.max_run_seconds * 1000);
     child.on('close', (code) => {
+      clearTimeout(timer);
       entry.cancelKill?.();
       this.finish(ref, result, result ? null : `claude 退出码 ${code}：${stderr.trim().slice(-500)}`);
     });
@@ -160,7 +173,9 @@ export class Runner {
       else if (run.interrupt_requested) status = 'interrupted';
       else if (result && !result.is_error && result.subtype === 'success') status = 'succeeded';
       else status = 'failed';
-      const err = error ?? (result && result.subtype !== 'success' ? result.subtype : null);
+      const err = run.error ?? error
+        ?? (result && result.subtype !== 'success' ? result.subtype : null)
+        ?? (result?.is_error ? (result.result ?? 'is_error').slice(0, 300) : null);  // 例如 API 层拒绝
       this.store.run(
         `UPDATE runs SET status = ?, ended_at = ?, num_turns = ?, cost_usd = ?, usage = ?, result = ?, error = ? WHERE id = ?`,
         status, now(), result?.num_turns ?? null, result?.total_cost_usd ?? null,
@@ -183,10 +198,10 @@ export class Runner {
     return Number(r.changes);
   }
 
-  interrupt(runId: string): boolean {
+  interrupt(runId: string, reason?: string): boolean {
     const run = this.store.get<RunRow>('SELECT * FROM runs WHERE id = ?', runId);
     if (!run || run.status !== 'running') return false;
-    this.store.run('UPDATE runs SET interrupt_requested = 1 WHERE id = ?', runId);
+    this.store.run('UPDATE runs SET interrupt_requested = 1, error = coalesce(?, error) WHERE id = ?', reason ?? null, runId);
     const entry = this.active.get(run.thread_id);
     // 先发信号，再取消审批：反过来的话 hook 拿到"拒绝"后 claude 会继续下一步
     if (entry?.container) entry.cancelKill = interruptTurn(entry.container, runId);

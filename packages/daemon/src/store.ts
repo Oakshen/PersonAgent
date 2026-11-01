@@ -68,6 +68,25 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** 给旧库补列：只加不改，加列都带默认值 */
+  private migrate(): void {
+    const add: [string, string, string][] = [
+      ['bots', 'daily_turn_budget', 'INTEGER NOT NULL DEFAULT 300'],
+      ['bots', 'max_run_seconds', 'INTEGER NOT NULL DEFAULT 1800'],
+      ['bots', 'max_actions', 'INTEGER NOT NULL DEFAULT 100'],
+    ];
+    for (const [table, col, def] of add) {
+      const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
+      if (!cols.includes(col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+    }
+  }
+
+  /** 一致性快照（WAL 下也安全），不阻塞写入太久 */
+  backup(file: string): void {
+    this.db.prepare('VACUUM INTO ?').run(file);
   }
 
   /** 同步事务；嵌套调用并入外层事务。事件在提交后才广播。 */
@@ -127,7 +146,10 @@ const toEvent = (r: EventRow): PagentEvent => ({
 });
 
 // ---- 行类型 ----
-export interface BotRow { id: string; name: string; persona: string; model: string | null; policy: string; max_turns: number; created_at: string }
+export interface BotRow {
+  id: string; name: string; persona: string; model: string | null; policy: string; max_turns: number; created_at: string;
+  daily_turn_budget: number; max_run_seconds: number; max_actions: number;
+}
 export interface ThreadRow { id: string; bot_id: string; session_id: string | null; created_at: string }
 export interface RunRow {
   id: string; thread_id: string; bot_id: string; status: string; hook_token: string; interrupt_requested: number;

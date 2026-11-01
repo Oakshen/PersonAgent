@@ -55,6 +55,12 @@ async function pre(store: Store, approvals: Approvals, run: RunRow, h: HookInput
   if (live.status !== 'running' || live.interrupt_requested) {
     decision = 'deny';
     reason = '这一轮已被中断';
+  } else {
+    const n = store.get<{ n: number }>('SELECT count(*) n FROM actions WHERE run_id = ?', run.id)!.n;
+    if (n >= bot.max_actions) {
+      decision = 'deny';
+      reason = `本轮工具调用已达上限 ${bot.max_actions} 次，请停下来汇报进展`;
+    }
   }
   const actionId = newId('act');
   const status = decision === 'allow' ? 'approved' : decision === 'deny' ? 'denied' : 'pending_approval';

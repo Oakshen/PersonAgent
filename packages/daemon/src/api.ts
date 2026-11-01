@@ -1,7 +1,7 @@
 // 本机管理 API：只监听 unix socket（0600），worker 所在的网络够不到它。
 // 手机 / 远程设备的入口在 P2 单独做（设备认证）。
 import http from 'node:http';
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, normalize } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { config } from './config.ts';
@@ -17,8 +17,15 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
 export const toBot = (r: BotRow): Bot => ({
   id: r.id, name: r.name, persona: r.persona, model: r.model,
-  policy: JSON.parse(r.policy) as PolicyRule[], maxTurns: r.max_turns, createdAt: r.created_at,
+  policy: JSON.parse(r.policy) as PolicyRule[], maxTurns: r.max_turns, dailyTurnBudget: r.daily_turn_budget,
+  maxRunSeconds: r.max_run_seconds, maxActions: r.max_actions, createdAt: r.created_at,
 });
+
+const posInt = (v: unknown, name: string): number | undefined => {
+  if (v === undefined) return undefined;
+  if (!Number.isInteger(v) || (v as number) <= 0) throw new HttpError(400, `${name} 须为正整数`);
+  return v as number;
+};
 
 class HttpError extends Error {
   code: number;
@@ -48,9 +55,14 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
     ['GET', /^\/bots\/([^/]+)$/, (m) => toBot(botByName(m[1]))],
     ['PATCH', /^\/bots\/([^/]+)$/, (m, b) => {
       const bot = botByName(m[1]);
-      store.run('UPDATE bots SET persona = ?, model = ?, policy = ?, max_turns = ? WHERE id = ?',
+      store.run(
+        `UPDATE bots SET persona = ?, model = ?, policy = ?, max_turns = ?, daily_turn_budget = ?, max_run_seconds = ?, max_actions = ?
+         WHERE id = ?`,
         b.persona ?? bot.persona, b.model === undefined ? bot.model : b.model,
-        b.policy ? JSON.stringify(b.policy) : bot.policy, b.maxTurns ?? bot.max_turns, bot.id);
+        b.policy ? JSON.stringify(b.policy) : bot.policy, posInt(b.maxTurns, 'maxTurns') ?? bot.max_turns,
+        posInt(b.dailyTurnBudget, 'dailyTurnBudget') ?? bot.daily_turn_budget,
+        posInt(b.maxRunSeconds, 'maxRunSeconds') ?? bot.max_run_seconds,
+        posInt(b.maxActions, 'maxActions') ?? bot.max_actions, bot.id);
       return toBot(store.get<BotRow>('SELECT * FROM bots WHERE id = ?', bot.id)!);
     }],
     ['POST', /^\/bots\/([^/]+)\/messages$/, (m, b) => {
@@ -135,6 +147,15 @@ export function startApi(store: Store, runner: Runner, approvals: Approvals, soc
       }
     }],
     ['DELETE', /^\/bots\/([^/]+)\/plugins\/([^/]+)$/, (m) => ({ ok: disable(store, botByName(m[1]).id, m[2]) })],
+    ['POST', /^\/backup$/, () => {
+      const dir = join(config.dataDir, 'backups');
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `pagent-${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
+      store.backup(file);
+      // 只保留最近 10 份
+      for (const old of readdirSync(dir).filter((f) => f.endsWith('.db')).sort().slice(0, -10)) rmSync(join(dir, old));
+      return { file };
+    }],
     ['GET', /^\/events$/, (_m, _b, url, res) => streamEvents(store, url, res)],
   ];
 

@@ -5,7 +5,7 @@
 // - 盒子重启（boot 变了）意味着进行中的轮次都没了，pagentd 据此收尾。
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import net from 'node:net';
 import { extname, join, normalize } from 'node:path';
@@ -80,13 +80,43 @@ function prepareAgent(agentId: string): string {
   // 共享 HOME 下的 ~/.claude/skills 也指向同一处：Agent 按习惯往那里装也能被所有 Agent 用上
   mkdirSync(join(HOME, '.claude'), { recursive: true });
   if (!lstatSync(join(HOME, '.claude', 'skills'), { throwIfNoEntry: false })) symlinkSync(SKILLS, join(HOME, '.claude', 'skills'));
-  const cred = join(dir, '.credentials.json');
-  if (existsSync(CRED) && !lstatSync(cred, { throwIfNoEntry: false })?.isSymbolicLink()) {
-    rmSync(cred, { force: true });
-    symlinkSync(CRED, cred);
-  }
+  syncCred();
   return dir;
 }
+
+/**
+ * 订阅凭据：每个 Agent 的 .credentials.json 都链到宿主挂进来的那一份。
+ * Claude CLI 刷新令牌时写新文件再 rename，会把链接换成一份普通文件；刷新令牌是轮换的，旧的随即作废。
+ * 所以以最新的一份为准：写回共享文件（原地写：它是单文件挂载，不能 rename 覆盖，宿主那边也就跟着更新），再把链接恢复。
+ */
+const credExpiry = (f: string): number => {
+  try { return Number(JSON.parse(readFileSync(f, 'utf8')).claudeAiOauth?.expiresAt ?? 0); } catch { return -1; }
+};
+function syncCred(): void {
+  if (!existsSync(CRED)) return;
+  const agentsDir = join(ROOT, 'agents');
+  const paths = (existsSync(agentsDir) ? readdirSync(agentsDir) : [])
+    .filter((id) => existsSync(join(agentsDir, id, 'claude')))
+    .map((id) => join(agentsDir, id, 'claude', '.credentials.json'));
+  const copies = paths.filter((p) => lstatSync(p, { throwIfNoEntry: false })?.isFile());
+  let best = CRED;
+  let bestExp = credExpiry(CRED);
+  for (const p of copies) {
+    const e = credExpiry(p);
+    if (e > bestExp) { best = p; bestExp = e; }
+  }
+  if (best !== CRED) {
+    writeFileSync(CRED, readFileSync(best));
+    console.log(`订阅凭据：采用 ${best} 里刷新过的令牌（${new Date(bestExp).toISOString()} 到期）`);
+  }
+  for (const p of paths) {
+    if (lstatSync(p, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
+    rmSync(p, { force: true });
+    symlinkSync(CRED, p);
+  }
+}
+// 一轮跑到一半刷新了令牌，也尽快让其他 Agent 用上
+setInterval(() => { try { syncCred(); } catch (e) { console.error('syncCred', e); } }, 30_000).unref();
 
 interface TurnReq {
   engine?: 'claude' | 'codex';

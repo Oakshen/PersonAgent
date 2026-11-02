@@ -1,4 +1,5 @@
 // 本机 API 与远程 API 共用的操作。
+import { waitingOn } from './collab.ts';
 import { engineOf } from './engines.ts';
 import type http from 'node:http';
 import { type AskRow, type BotRow, type RunRow, type Store, bus, newId, now } from './store.ts';
@@ -70,6 +71,7 @@ export function botStatus(store: Store, botId: string): BotStatus {
     return t && /^mcp__(screen|browser)__/.test(t.tool) ? 'computer' : 'working';
   }
   if (has('SELECT 1 FROM asks WHERE bot_id = ? AND answered_at IS NULL')) return 'asking';
+  if (has("SELECT 1 FROM assignments WHERE from_bot = ? AND status IN ('queued', 'asking') AND delivered_at IS NULL")) return 'waiting';
   const last = store.get<{ status: string }>('SELECT status FROM runs WHERE bot_id = ? ORDER BY started_at DESC LIMIT 1', botId);
   return last?.status === 'failed' ? 'failed' : 'idle';
 }
@@ -81,7 +83,7 @@ export function snapshot(store: Store) {
       const last = store.get<{ ts: string; type: string; data: string }>(
         "SELECT ts, type, data FROM events WHERE bot_id = ? AND type IN ('assistant.text', 'message.queued') ORDER BY seq DESC LIMIT 1", b.id);
       return {
-        id: b.id, name: b.name, persona: b.persona, model: b.model, engine: engineOf(b.engine), createdAt: b.created_at, status: botStatus(store, b.id),
+        id: b.id, name: b.name, persona: b.persona, model: b.model, engine: engineOf(b.engine), createdAt: b.created_at, status: botStatus(store, b.id), waitingOn: waitingOn(store, b.id),
         lastText: last ? String(JSON.parse(last.data).text ?? '').slice(0, 120) : null,
         lastAt: last?.ts ?? null,
       };

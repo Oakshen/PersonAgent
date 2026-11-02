@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS secrets (
 CREATE TABLE IF NOT EXISTS push_subs (
   endpoint TEXT PRIMARY KEY, device_id TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS assignments (
+  id TEXT PRIMARY KEY, batch TEXT NOT NULL, from_bot TEXT NOT NULL, to_bot TEXT NOT NULL, status TEXT NOT NULL,
+  result TEXT, meta TEXT NOT NULL, created_at TEXT NOT NULL, settled_at TEXT, delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_assignments_batch ON assignments(batch);
+CREATE INDEX IF NOT EXISTS idx_assignments_to ON assignments(to_bot, status);
 CREATE TABLE IF NOT EXISTS groups (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, members TEXT NOT NULL, manager_id TEXT, created_at TEXT NOT NULL
 );

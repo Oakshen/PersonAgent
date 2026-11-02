@@ -28,7 +28,8 @@ const S = {
   screen: null,          // 正在看的屏幕 { botId, mode: 'preview' | 'takeover', rfb }
 };
 
-const STATUS_TEXT = { working: '工作中…', computer: '正在用电脑', asking: '在等你回答', failed: '上一轮失败' };
+const STATUS_TEXT = { working: '工作中…', computer: '正在用电脑', asking: '在等你回答', waiting: '在等成员回复', failed: '上一轮失败' };
+const statusText = (b) => (b.status === 'waiting' && b.waitingOn?.length ? `在等 ${b.waitingOn.join('、')} 回复` : STATUS_TEXT[b.status]);
 
 // ---------- 小工具 ----------
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -359,7 +360,7 @@ function renderSide() {
     .sort((a, b) => (b.lastAt ?? b.createdAt ?? '').localeCompare(a.lastAt ?? a.createdAt ?? ''));
   const current = (b) => (S.view === 'chat' || S.view === 'memory') && S.bot?.id === b.id;
   const row = (b) => {
-    const st = STATUS_TEXT[b.status];
+    const st = statusText(b);
     return h('button', { class: 'row', 'aria-current': current(b) ? 'true' : null, onclick: () => openBot(b) },
       seal(b.name, 38, b.status),
       h('span', { class: 'txt' },
@@ -432,7 +433,7 @@ function renderHead() {
     h('button', { class: 'back-btn', 'aria-label': '返回', onclick: () => { S.view = 'home'; render(); } }, '‹'),
     seal(b.name, 36, b.status),
     h('div', { class: 'who' }, h('b', {}, b.name, h('span', { class: `engine ${b.engine}` }, b.engine === 'codex' ? 'Codex' : 'Claude')),
-      h('small', {}, STATUS_TEXT[b.status] ?? (b.persona || '没有设定人设'))),
+      h('small', {}, statusText(b) ?? (b.persona || '没有设定人设'))),
     h('button', { class: 'head-btn', 'aria-pressed': S.screen?.botId === b.id ? 'true' : 'false', onclick: () => toggleScreen(b) }, '屏幕'),
     h('button', { class: 'head-btn', onclick: () => openMemory(b).catch((e) => toast(e.message)) }, '它记得什么'),
     h('button', { class: 'head-btn', onclick: () => botMenu(b) }, '设置'));
@@ -990,7 +991,7 @@ function renderGroupLog(toEnd = false) {
       node = h('div', { class: 'gsay' }, who !== lastSpeaker ? h('div', { class: 'from' }, seal(who, 20), who) : null, h('div', { class: 'say' }, md(d.text)));
       lastSpeaker = who;
     } else if (e.type === 'agent.message') {
-      node = h('div', { class: 'handoff' }, seal(nameOf(e.botId), 18), h('b', {}, nameOf(e.botId)), ' → ', seal(d.to, 18), h('b', {}, d.to), h('span', {}, String(d.text).slice(0, 140)));
+      node = h('div', { class: 'handoff' }, seal(nameOf(e.botId), 18), h('b', {}, nameOf(e.botId)), ' → ', seal(d.to, 18), h('b', {}, d.to), h('span', { class: 'htext' }, String(d.text).slice(0, 140)));
       lastSpeaker = null;
     } else if (e.type === 'tool.use' && !/^mcp__pagent__(message_agent|remember|ask_user|list_agents)$/.test(d.name) && d.name !== 'ToolSearch') {
       if (nameOf(e.botId) !== lastSpeaker) lastSpeaker = null;

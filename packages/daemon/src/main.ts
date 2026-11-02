@@ -13,7 +13,7 @@ import { startScheduler } from './routines.ts';
 import { pushFor } from './push.ts';
 import { bus } from './store.ts';
 import { LocalExec } from './localexec.ts';
-import { forwardReplies } from './collab.ts';
+import { afterRunCollab, sweepAssignments } from './collab.ts';
 
 mkdirSync(config.dataDir, { recursive: true });
 const store = new Store(join(config.dataDir, 'pagent.db'));
@@ -26,7 +26,8 @@ const link = new BoxLink(store, (ev) => runner.onBoxEvent(ev), (boot) => runner.
 runner.recover().catch((e) => console.error('recover failed', e)).finally(() => link.start());
 const localExec = new LocalExec(store);
 const mcp = startMcpServer(store, { requestNewSession: (id, r) => runner.requestNewSession(id, r), localExec, runner }, config.mcpPort);
-runner.hooks.afterRun = (_ref, bot, status, text, metas) => forwardReplies(store, runner, bot, status, text, metas);
+runner.hooks.afterRun = (ref, bot, status, text, metas) => afterRunCollab(store, runner, bot, ref.runId, status, text, metas);
+const collabSweep = setInterval(() => { try { sweepAssignments(store, runner); } catch (e) { console.error('collab sweep', e); } }, 60_000);
 const scheduler = startScheduler(store, runner);
 bus.on('event', (e) => pushFor(store, e));
 const api = startApi(store, runner, devices, config.sock);
@@ -40,6 +41,7 @@ function shutdown(sig: string) {
   console.log(`${sig}：退出（${runner.activeRuns().length} 个轮次留在盒子里继续）`);
   link.stop();
   clearInterval(scheduler);
+  clearInterval(collabSweep);
   api.close();
   remote.close();
   mcp.close();

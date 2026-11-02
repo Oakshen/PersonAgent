@@ -65,4 +65,4 @@ export type EventType =
   | 'engine.changed';      // 引擎登录状态变了
 
 /** Bot 在名单上的状态（印章角标）。asking：它问了你一个问题，还没回答 */
-export type BotStatus = 'idle' | 'working' | 'computer' | 'asking' | 'failed';
+export type BotStatus = 'idle' | 'working' | 'computer' | 'asking' | 'waiting' | 'failed';

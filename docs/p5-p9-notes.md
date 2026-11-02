@@ -49,7 +49,11 @@ Bot 状态多了 `computer`（最近一个工具是 screen / browser）。
 ## P8 协作
 
 - `collab.ts`：
-  - `list_agents`、`message_agent(to, text, expectReply=true)`：消息排进对方当前会话（`meta.from / replyTo / depth / group`）。对方这一轮结束时，`runner.hooks.afterRun` 把它最后的回复自动发回给发起方（`meta.reply=true`，回复不再要求回复）。发起方不用轮询。
+  - `list_agents`、`message_agent(to, text, expectReply=true)`：消息排进对方当前会话，并在 `assignments` 表记一条托付（`meta.assignment`）。
+  - **等齐了再交回**（借鉴 OpenMausBot 的任务树）：同一轮里托付出去的事是一批。每件做完先记下结果；这一批全部有结果、且发起的那一轮也结束了，才合成一条消息发回发起方（`meta.reply=true`，回复不再要求回复）。总管只醒一次，拿着全部结果汇总，不用轮询。
+  - 对方停下来问用户（选择卡、接管）时这件事继续等，用户回答后那一轮的结果才算数。
+  - 等超过 60 分钟（`PAGENT_COLLAB_WAIT_MIN`）就先交回已有的结果，迟到的之后单独发。
+  - 发起方在等时状态是 `waiting`，网页显示「在等 X、Y 回复」。
   - 环路保护：转发层数 ≤ 4（一轮的层数取触发它的消息里最大的）；每个 Agent 每小时最多发 30 条。
   - `notify_user` 在 P6 已做。
 - 群聊：`groups` 表（成员、可选总管）。你在群里说话：@ 到谁就发给谁；没 @ 就交给总管（没有总管就发给所有成员）。总管收到的消息里附带成员名单和"用 message_agent 分派、回来后汇总"的提示。
@@ -67,3 +71,9 @@ Bot 状态多了 `computer`（最近一个工具是 screen / browser）。
 
 - 出口：设置 → 网络 → "走家里线路"，写 `data/egress-upstreams.json` 给 egress 代理按容器选上游；`PAGENT_HOME_PROXY` 从 `data/home-proxy` 读。
 - 部署：`rsync` 到 claude-2 后 `npx tsc -p . && ./deploy/dc.sh restart pagentd`；改了 `packages/host` 要 `docker restart pagent-box`。
+
+## 订阅凭据同步（2026-11-02 修复）
+
+Claude CLI 刷新令牌时写新文件再 rename，会把 Agent 配置目录里指向宿主凭据的软链接换成普通文件；刷新令牌是轮换的，其他 Agent 手里的旧令牌随即作废（表现为 `OAuth session expired and could not be refreshed`）。网关的 `syncCred()` 在每轮开始前和每 30 秒做一次：以到期时间最晚的一份为准，原地写回共享文件（宿主 `~/.claude/.credentials.json` 也随之更新），再把各 Agent 的软链接恢复。
+
+剩下的风险：两个 Agent 恰好同时发现令牌过期、同时刷新，后到的那个会失败一轮；如果在 claude-2 宿主上直接用 claude 并触发刷新，宿主那边会 rename 出一个新文件，盒子里的单文件挂载仍指向旧文件，需要 `docker restart pagent-box` 重新挂载。

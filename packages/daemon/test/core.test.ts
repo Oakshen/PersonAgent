@@ -249,32 +249,87 @@ test('Web Push 加密：RFC 8291 附录的示例', async () => {
     'DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN');
 });
 
-test('协作：message_agent 排进对方会话，回复自动发回；层数到上限被拒；群消息交给总管', async () => {
-  const { store, botId, runId } = fixture();
-  const { messageAgent, forwardReplies, createGroup, postToGroup, MAX_DEPTH } = await import('../src/collab.ts');
+test('协作：托付排进对方会话；同一轮托付的几件事等齐了一次交回；问用户时继续等；超时先交回已有的', async () => {
+  const { store, botId, threadId, runId } = fixture();
+  const { messageAgent, afterRunCollab, sweepAssignments, waitingOn, createGroup, postToGroup, MAX_DEPTH } = await import('../src/collab.ts');
   const runner = new TestRunner(store);
-  const otherId = newId('bot');
-  store.run("INSERT INTO bots(id, name, created_at) VALUES (?, '研究员', ?)", otherId, now());
+  const mk = (name: string) => { const id = newId('bot'); store.run('INSERT INTO bots(id, name, created_at) VALUES (?, ?, ?)', id, name, now()); return store.get<any>('SELECT * FROM bots WHERE id = ?', id); };
   const me = store.get<any>('SELECT * FROM bots WHERE id = ?', botId);
-  const other = store.get<any>('SELECT * FROM bots WHERE id = ?', otherId);
+  const a = mk('研究员'), b = mk('程序员');
+  const queued = (bid: string) => store.all<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", bid);
+  /** 模拟对方跑一轮：消费排队的消息，返回这一轮的 run id 和消息 meta */
+  const consume = (bot: any) => {
+    const msgs = queued(bot.id);
+    const r = newId('run');
+    store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at) VALUES (?,?,?, 'succeeded', 't', ?)", r, msgs[0].thread_id, bot.id, now());
+    for (const m of msgs) store.run("UPDATE messages SET status = 'consumed', run_id = ? WHERE id = ?", r, m.id);
+    return { r, metas: msgs.map((m) => JSON.parse(m.meta ?? '{}')) };
+  };
+  const finish = (bot: any, text: string, status = 'succeeded') => { const { r, metas } = consume(bot); store.tx(() => afterRunCollab(store, runner, bot, r, status, text, metas)); return r; };
+
   messageAgent(store, runner, me, runId, '研究员', '查一下 A');
-  const got = store.get<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", otherId);
-  const meta = JSON.parse(got.meta);
-  assert.deepEqual([meta.from, meta.replyTo, meta.depth], ['小助手', botId, 1]);
+  messageAgent(store, runner, me, runId, '程序员', '算一下 B');
+  const meta = JSON.parse(queued(a.id)[0].meta);
+  assert.deepEqual([meta.from, meta.depth, !!meta.assignment], ['小助手', 1, true]);
   assert.throws(() => messageAgent(store, runner, me, runId, '小助手', 'x'), /自己/);
-  // 对方做完：回复发回给我，标记 reply，不会再要求回复
-  forwardReplies(store, runner, other, 'succeeded', 'A 是 42', [meta]);
-  const back = store.all<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", botId);
+  assert.deepEqual(waitingOn(store, botId).sort(), ['研究员', '程序员'].sort());
+
+  // 研究员先做完：还差程序员，不交回
+  finish(a, 'A 是 42');
+  assert.equal(queued(botId).length, 0);
+  // 程序员做完，但发起的那一轮还在跑：仍然不交回
+  finish(b, 'B 是 7');
+  assert.equal(queued(botId).length, 0);
+  // 发起的那一轮结束：一条消息带两份结果
+  store.run("UPDATE runs SET status = 'succeeded' WHERE id = ?", runId);
+  store.tx(() => afterRunCollab(store, runner, me, runId, 'succeeded', '已分工', []));
+  const back = queued(botId);
   assert.equal(back.length, 1);
-  assert.ok(back[0].content.includes('A 是 42'));
+  assert.ok(back[0].content.includes('A 是 42') && back[0].content.includes('B 是 7') && back[0].content.includes('2 件事'));
   assert.equal(JSON.parse(back[0].meta).reply, true);
-  forwardReplies(store, runner, me, 'succeeded', '收到', [JSON.parse(back[0].meta)]);
-  assert.equal(store.all<any>("SELECT * FROM messages WHERE status = 'queued' AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)", otherId).length, 1);
+  assert.deepEqual(waitingOn(store, botId), []);
+  // 回复不再触发回复
+  finish(me, '汇总好了');
+  assert.equal(queued(a.id).length + queued(b.id).length, 0);
+
+  // 对方停下来问用户：继续等；用户回答后的那一轮结果才交回
+  const run2 = newId('run');
+  store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at) VALUES (?,?,?, 'running', 't2', ?)", run2, threadId, botId, now());
+  messageAgent(store, runner, me, run2, '研究员', '订一张票');
+  store.run("UPDATE runs SET status = 'succeeded' WHERE id = ?", run2);
+  const { r: askRun, metas } = consume(a);
+  store.run("INSERT INTO asks(id, run_id, bot_id, thread_id, question, options, allow_custom, created_at) VALUES ('ask1', ?, ?, ?, '哪天？', '[]', 1, ?)", askRun, a.id, threadId, now());
+  store.tx(() => afterRunCollab(store, runner, a, askRun, 'succeeded', '在等用户选日期', metas));
+  assert.equal(queued(botId).length, 0);
+  assert.deepEqual(waitingOn(store, botId), ['研究员']);
+  runner.enqueue(a.id, '周五');
+  finish(a, '订好了周五的票');
+  assert.ok(queued(botId).some((m) => m.content.includes('订好了周五的票')));
+
+  // 超时：先交回已有的，迟到的单独发
+  store.run("UPDATE messages SET status = 'consumed' WHERE status = 'queued'");
+  const run3 = newId('run');
+  store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at) VALUES (?,?,?, 'succeeded', 't3', ?)", run3, threadId, botId, now());
+  messageAgent(store, runner, me, run3, '研究员', '查 C');
+  messageAgent(store, runner, me, run3, '程序员', '查 D');
+  finish(b, 'D 是 1');
+  store.run('UPDATE messages SET status = ? WHERE status = ? AND thread_id IN (SELECT id FROM threads WHERE bot_id = ?)', 'parked', 'queued', a.id);
+  sweepAssignments(store, runner, -1);
+  const partial = queued(botId);
+  assert.equal(partial.length, 1);
+  assert.ok(partial[0].content.includes('D 是 1') && partial[0].content.includes('还没回复'));
+  store.run("UPDATE messages SET status = 'consumed' WHERE status = 'queued'");
+  store.run('UPDATE messages SET status = ? WHERE status = ?', 'queued', 'parked');
+  finish(a, 'C 是 9');
+  assert.ok(queued(botId).some((m) => m.content.includes('C 是 9') && m.content.includes('迟到')));
+
   // 层数到上限
   const deep = newId('run');
-  store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at) VALUES (?,?,?, 'running', 't', ?)", deep, got.thread_id, otherId, now());
-  store.run('UPDATE messages SET status = ?, run_id = ?, meta = ? WHERE id = ?', 'consumed', deep, JSON.stringify({ depth: MAX_DEPTH }), got.id);
-  assert.throws(() => messageAgent(store, runner, other, deep, '小助手', '再转'), /上限/);
+  runner.enqueue(a.id, '再转一次', { depth: MAX_DEPTH });
+  const dm = queued(a.id).at(-1);
+  store.run("INSERT INTO runs(id, thread_id, bot_id, status, hook_token, started_at) VALUES (?,?,?, 'running', 't4', ?)", deep, dm.thread_id, a.id, now());
+  store.run("UPDATE messages SET status = 'consumed', run_id = ? WHERE id = ?", deep, dm.id);
+  assert.throws(() => messageAgent(store, runner, a, deep, '小助手', '再转'), /上限/);
   // 群：没 @ 交给总管，@ 到谁就给谁
   const g = createGroup(store, { name: '小组', members: ['小助手', '研究员'], manager: '小助手' }, '用户');
   assert.deepEqual(postToGroup(store, runner, g.id, '做个调研', '用户').targets, ['小助手']);

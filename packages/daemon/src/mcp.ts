@@ -132,8 +132,8 @@ const TOOLS = [
   },
   {
     name: 'message_agent',
-    description: '给另一个 Agent 发消息、托付一件事。消息排进它当前的会话；它这一轮做完后，最后的回复会自动作为一条消息发回给你，'
-      + '所以发完就结束这一轮，等回复到了再继续（不要轮询）。要同时托付几件事，就连续调用几次。'
+    description: '给另一个 Agent 发消息、托付一件事。消息排进它当前的会话；它做完后，最后的回复会自动交回给你。'
+      + '同一轮里托付出去的几件事算一批，全部有结果后合成一条消息一次性发给你，所以要并行分工就在同一轮里连续调用几次，然后结束这一轮（不要轮询）。'
       + '把任务写完整：背景、要做什么、要交回什么。不需要回复（只是告知）时传 expectReply=false。',
     inputSchema: {
       type: 'object', required: ['to', 'text'],
@@ -245,7 +245,7 @@ export function startMcpServer(store: Store, hooks: McpHooks, port: number): htt
       if (!hooks.runner) return text('协作没有启用', true);
       try {
         const r = messageAgent(store, hooks.runner, bot, run.id, String(args?.to ?? ''), String(args?.text ?? ''), args?.expectReply !== false);
-        return text(args?.expectReply === false ? `已发给 ${r.to}。` : `已发给 ${r.to}。它做完后回复会自动发给你；如果没有别的事要做，现在就结束这一轮。`);
+        return text(args?.expectReply === false ? `已发给 ${r.to}。` : `已发给 ${r.to}。这一轮托付出去的事全部有结果后，会合成一条消息一次性发给你（不用轮询，也不用等）；没有别的事要做的话，现在就结束这一轮。`);
       } catch (e) {
         if (e instanceof ServiceError) return text(e.message, true);
         throw e;

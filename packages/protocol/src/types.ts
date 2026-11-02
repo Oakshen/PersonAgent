@@ -62,6 +62,7 @@ export type EventType =
   | 'agent.message'        // Agent 之间发消息
   | 'group.changed'        // 群聊新建 / 改成员
   | 'secret.changed'       // 保险箱条目变了（只有名字，没有值）
+  | 'secret.used'          // 某一轮取用了保险箱的一条（只有名字）
   | 'engine.changed';      // 引擎登录状态变了
 
 /** Bot 在名单上的状态（印章角标）。asking：它问了你一个问题，还没回答 */

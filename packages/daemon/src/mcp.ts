@@ -7,7 +7,7 @@ import { MemoryError, rememberGlobal } from './memory.ts';
 import { createRoutine, deleteRoutine, listRoutines } from './routines.ts';
 import { ServiceError } from './service.ts';
 import type { LocalExec } from './localexec.ts';
-import { listSecrets } from './vault.ts';
+import { allSecrets, listSecrets } from './vault.ts';
 import { readBody, send } from './http.ts';
 import type { Runner } from './runner.ts';
 import { listAgents, messageAgent } from './collab.ts';
@@ -122,7 +122,7 @@ const TOOLS = [
   },
   {
     name: 'list_secrets',
-    description: '列出保险箱里有哪些凭据（只有名字和说明，没有值）。命令里用环境变量 $名字 引用；网页登录时用 screen 的 fill_secret 把值填进当前输入框，不要把值打印出来。',
+    description: '列出保险箱里有哪些凭据（只有名字和说明，没有值）。命令里用 $(pagent-secret 名字) 现取现用，例如 curl -H "Authorization: Bearer $(pagent-secret GITHUB_TOKEN)" …；网页登录时用 screen 的 fill_secret 把值填进当前输入框。不要把值打印出来或写进文件。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -281,10 +281,18 @@ export function startMcpServer(store: Store, hooks: McpHooks, port: number): htt
 
   const server = http.createServer(async (req, res) => {
     try {
-      if (req.url !== '/mcp') return send(res, 404, { error: 'not found' });
+      if (req.url !== '/mcp' && req.url !== '/secret') return send(res, 404, { error: 'not found' });
       if (req.method !== 'POST') return res.writeHead(405).end();
       const run = authenticate(store, req);
       if (!run) return send(res, 401, { error: 'bad run token' });
+      // 保险箱按需取用：盒子里的 pagent-secret 命令和屏幕的 fill_secret 凭本轮令牌一条一条取，取用记在时间线上
+      if (req.url === '/secret') {
+        const name = String(JSON.parse(await readBody(req, 4096))?.name ?? '');
+        const all = allSecrets(store);
+        if (!(name in all)) return send(res, 404, { error: `保险箱里没有 ${name}`, names: Object.keys(all) });
+        store.emit('secret.used', { name }, { botId: run.bot_id, threadId: run.thread_id, runId: run.id });
+        return send(res, 200, { value: all[name] });
+      }
       const msg = JSON.parse(await readBody(req, 1024 * 1024));
       const out = Array.isArray(msg) ? (await Promise.all(msg.map((m) => handle(run, m)))).filter(Boolean) : await handle(run, msg);
       if (!out || (Array.isArray(out) && !out.length)) return res.writeHead(202).end();

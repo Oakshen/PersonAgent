@@ -8,7 +8,8 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import net from 'node:net';
-import { extname, join, normalize } from 'node:path';
+import { dirname, extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { Screens } from './screens.ts';
 import { rpc, screenTool } from './screen-mcp.ts';
@@ -19,10 +20,12 @@ const TOKEN = process.env.PAGENT_GATEWAY_TOKEN ?? '';
 const HOME = process.env.HOME ?? '/home/box';
 const ROOT = join(HOME, '.pagent');
 const SKILLS = join(ROOT, 'skills');
-const CRED = '/opt/pagent-cred/.credentials.json';
+const CRED = process.env.PAGENT_CRED ?? '/opt/pagent-cred/.credentials.json';
 // Codex 引擎：所有 Agent 共用一个 CODEX_HOME（一份 ChatGPT 登录，免得多份刷新令牌互相顶掉；会话按 id 区分）
 const CODEX_HOME = join(ROOT, 'codex');
-const WORKSPACE = '/workspace';
+const WORKSPACE = process.env.PAGENT_WORKSPACE ?? '/workspace';
+// 盒子里给 Agent 用的小命令（pagent-secret）
+const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin');
 const BOOT = randomUUID();
 const EVENTS_MAX_BYTES = 200 * 1024 * 1024;   // pagentd 长时间不来确认时的兜底上限
 
@@ -52,7 +55,7 @@ function ack(upTo: number): void {
 // ---- 轮次 ----
 
 interface Run {
-  runId: string; agentId: string; token: string; secrets: Record<string, string>; status: 'running' | 'exited'; child: ChildProcessWithoutNullStreams;
+  runId: string; agentId: string; token: string; getSecret: (name: string) => Promise<string>; status: 'running' | 'exited'; child: ChildProcessWithoutNullStreams;
   stderr: string; killTimer?: NodeJS.Timeout; timeout?: NodeJS.Timeout; startedAt: number; endedAt?: number;
 }
 const runs = new Map<string, Run>();
@@ -122,7 +125,6 @@ interface TurnReq {
   engine?: 'claude' | 'codex';
   agentId: string; runId: string; prompt: string; systemPrompt?: string | null; sessionId?: string | null;
   mcpConfig: unknown; model?: string | null; maxTurns: number; pluginDirs?: string[]; maxSeconds: number;
-  secrets?: Record<string, string>;   // 保险箱：整份给这一轮（环境变量 + fill_secret），轮次结束就丢
 }
 
 function runTurn(r: TurnReq): Run {
@@ -163,12 +165,23 @@ function runTurn(r: TurnReq): Run {
   }
 
   const { PAGENT_GATEWAY_TOKEN: _t, ...base } = process.env;
+  // 保险箱按需取用：凭 pagentd 给这一轮的令牌，向 pagentd 一条一条取（盒子里的 pagent-secret 命令和 fill_secret 都走这里）
+  const pagent = (mcpConfig.mcpServers as Record<string, any>).pagent ?? {};
+  const secretUrl = String(pagent.url ?? '').replace(/\/mcp$/, '/secret');
+  const auth = String(pagent.headers?.Authorization ?? '');
+  const getSecret = async (name: string): Promise<string> => {
+    const res = await fetch(secretUrl, { method: 'POST', headers: { authorization: auth, 'x-pagent-run': r.runId, 'content-type': 'application/json' }, body: JSON.stringify({ name }) });
+    const d = await res.json().catch(() => ({})) as { value?: string; error?: string; names?: string[] };
+    if (!res.ok) throw new Error(`${d.error ?? `HTTP ${res.status}`}${d.names ? `。可用的：${d.names.join('、') || '（空）'}` : ''}`);
+    return d.value ?? '';
+  };
   // detached：claude 成为新进程组的组长，中断时对整组发信号（连同它起的子进程）
   const child = spawn(engine, args, {
     cwd: WORKSPACE, detached: true, stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...base, CLAUDE_CONFIG_DIR: configDir, PAGENT_RUN_ID: r.runId, PAGENT_AGENT_ID: r.agentId, DISPLAY: `:${n}`, ...secretEnv(r.secrets), ...extraEnv },
+    env: { ...base, CLAUDE_CONFIG_DIR: configDir, PAGENT_RUN_ID: r.runId, PAGENT_AGENT_ID: r.agentId, DISPLAY: `:${n}`,
+      PATH: `${BIN}:${base.PATH ?? ''}`, PAGENT_SECRET_URL: secretUrl, PAGENT_RUN_AUTH: auth, ...extraEnv },
   }) as ChildProcessWithoutNullStreams;
-  const run: Run = { runId: r.runId, agentId: r.agentId, token, secrets: r.secrets ?? {}, status: 'running', child, stderr: '', startedAt: Date.now() };
+  const run: Run = { runId: r.runId, agentId: r.agentId, token, getSecret, status: 'running', child, stderr: '', startedAt: Date.now() };
   runs.set(r.runId, run);
   push('turn.started', { runId: r.runId, agentId: r.agentId, engine, pid: child.pid ?? null });
 
@@ -180,7 +193,6 @@ function runTurn(r: TurnReq): Run {
     try { msg = JSON.parse(line); } catch { return; }
     push('turn.line', { runId: r.runId, agentId: r.agentId, engine, msg });
   });
-  child.on('close', () => { run.secrets = {}; });
   run.timeout = setTimeout(() => {
     push('turn.timeout', { runId: r.runId, agentId: r.agentId, maxSeconds: r.maxSeconds });
     interrupt(run, 8000);
@@ -194,13 +206,6 @@ function runTurn(r: TurnReq): Run {
     push('turn.finished', { runId: r.runId, agentId: r.agentId, code, signal, stderr: run.stderr.trim().slice(-1000) });
   });
   return run;
-}
-
-/** 保险箱条目作为环境变量：名字是大写下划线的才给，避免覆盖 PATH 这类系统变量 */
-function secretEnv(s: Record<string, string> | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(s ?? {})) if (/^[A-Z][A-Z0-9_]{1,63}$/.test(k) && !/^(PATH|HOME|DISPLAY|CLAUDE_|CODEX_|PAGENT_|HTTPS?_PROXY|NO_PROXY)/.test(k)) out[k] = v;
-  return out;
 }
 
 // ---- Codex ----
@@ -353,7 +358,7 @@ const server = createServer(async (req, res) => {
       const run = runFor(req);
       if (!run) return send(res, 401, { error: 'bad run token' });
       const msg = await body(req);
-      const call = (name: string, a: any) => screenTool(screens, run.agentId, name, a, run.secrets);
+      const call = (name: string, a: any) => screenTool(screens, run.agentId, name, a, run.getSecret);
       const out = Array.isArray(msg) ? (await Promise.all(msg.map((m) => rpc(m, call)))).filter(Boolean) : await rpc(msg, call);
       if (!out || (Array.isArray(out) && !out.length)) return res.writeHead(202).end();
       return send(res, 200, out);

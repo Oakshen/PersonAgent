@@ -64,7 +64,7 @@
 | 盒内自动审查分类器 | 决定自动执行还是问你 | **不做**（v3 决定） |
 | `refreshMcp`：设置里的 MCP 推送到盒子；Bot 用命令起的 MCP 所有 Bot 可用 | 共享 MCP | pagent MCP（记忆、选择卡、新会话）+ 插件 MCP + 盒内 MCP，全部 Agent 共享 |
 | 本机执行守护进程 `local-exec-daemon`（SSE 拉取 `/local-exec/requests`，`ExternalShell / ExternalRead / AwaitExternalShell`） | 让盒子在你的 Mac 上执行命令 | **P7 可选**：同样的拉取协议；权限只有"关闭 / 允许"两档，默认关闭（第 10 节） |
-| `setBoxSecrets` + Keychain；Vault / 安全表单"模型看不见值" | 凭据 | **P7 保险箱**：pagentd 加密存放，推进盒子的环境变量或代填，模型不看明文 |
+| `setBoxSecrets` + Keychain；Vault / 安全表单"模型看不见值" | 凭据 | **P7 保险箱**：pagentd 加密存放，按需现取或代填，模型不看明文 |
 | `sand-webauthn-signer`、1Password 启动器 | 通行密钥、密码管理器 | 暂不做；遇到通行密钥或二步验证就请你接管屏幕 |
 | 会话存在后端，不在盒子上（`rm -rf` 删不掉聊天） | 盒子坏了不丢聊天 | 时间线和事件在 pagentd；Claude Code 的 session 文件在盒子的持久卷上 |
 
@@ -246,7 +246,7 @@ Grok 的文档说"浏览器 cookie 和登录状态在所有 Bot 之间共享"，
   - 文件路径限制在指定目录内，并检查符号链接。
   - 权限只有"关闭 / 允许"两档，按设备设置，**默认关闭**，不做逐条审批。开了就等于把那台 Mac 也交给 Agent。
 - **保险箱**：
-  - 密码和 token 在 pagentd 加密保存，按需推进盒子的环境变量，或者由 `pagent-host` 直接代填进网页表单，模型看不到明文。
+  - 密码和 token 在 pagentd 加密保存，Agent 在命令里用 `pagent-secret` 按需现取（P10 起不再推进环境变量），或者由 `pagent-host` 直接代填进网页表单，模型看不到明文。
   - 推送时要么整份成功，要么不推，不会只推一半（同 Grok 的 `setBoxSecrets`）。
 
 ## 11. Agent 之间协作（P8）
@@ -260,7 +260,7 @@ Grok 的文档说"浏览器 cookie 和登录状态在所有 Bot 之间共享"，
 ## 13. 客户端
 
 - **Web 控制台**：现代简洁风格（P3 已改），新增"屏幕"预览和接管、"它会的技能"列表。
-- **手机**：Tailscale serve 提供 HTTPS；以后做原生 App，带推送。
+- **手机**：放在最后一步（P14）。先把底层和网页端做好；手机再用 Tailscale serve 提供 HTTPS，以 PWA 的形式用。
 
 ## 14. 阶段
 
@@ -268,11 +268,23 @@ Grok 的文档说"浏览器 cookie 和登录状态在所有 Bot 之间共享"，
 |---|---|---|
 | P0~P3 | ✅ 已完成（见 p0-findings、p1~p3-notes） | — |
 | **P4 盒子化（复刻 0.18 架构）** ✅ 已完成，见 [p4-notes](p4-notes.md) | `pagent-box` 镜像与持久卷；`pagent-host` 网关（`/health`、`/api/runTurn`、`/api/interrupt`、`/events` 续传、记忆文件读写）；`ensureBox()`；pagentd 改为经网关执行；共享 skill、命令行凭据；把现有 4 个 Agent 的会话和记忆迁进盒子；去掉每 Agent 一个容器 | ① 现有 Agent 迁移后还记得之前的对话和记忆；② Agent A 在盒子里 `gh auth login`，Agent B 直接能用；③ A 装的 skill，B 下一轮能用；④ 一轮进行到一半时重启 pagentd，这一轮继续跑完，事件不丢不重；⑤ 重建盒子（换镜像）后，`/workspace`、会话、记忆都在；⑥ v3 的 e2e 全部通过 |
-| **P5 屏幕** ✅ 已完成，见 [p5-p9-notes](p5-p9-notes.md) | Xvfb 按 Agent 分显示器、`box-chrome`（CDP 9222+n）、noVNC 经 pagentd 代理、`computer` 和浏览器 MCP、状态 / 预览 / 接管、浏览器登录共享 spike、出口可选家里线路 | 让 Agent 登录一个需要二步验证的网站：它发"请你接管"卡片，你在手机上完成验证，交还后它接着做；另一个 Agent 随后直接以登录状态访问该网站 |
-| P6 Routine 与通知 ✅ | 定时和 webhook 触发，在会话里运行；推送 | "每天 8 点"连续跑一周，没新内容时不打扰 |
+| **P5 屏幕** ✅ 已完成（手机上的验收挪到 P14），见 [p5-p9-notes](p5-p9-notes.md) | Xvfb 按 Agent 分显示器、`box-chrome`（CDP 9222+n）、noVNC 经 pagentd 代理、`computer` 和浏览器 MCP、状态 / 预览 / 接管、浏览器登录共享 spike、出口可选家里线路 | 让 Agent 登录一个需要二步验证的网站：它发"请你接管"卡片，你在手机上完成验证，交还后它接着做；另一个 Agent 随后直接以登录状态访问该网站 |
+| P6 Routine 与通知 ✅（只用 2 分钟一次的 Routine 测过；连跑一周和真机推送挪到 P14） | 定时和 webhook 触发，在会话里运行；推送 | "每天 8 点"连续跑一周，没新内容时不打扰 |
 | P7 本机执行与保险箱 ✅ | `local-exec` 守护进程、三个 External 工具；保险箱 | 在盒子里让 Agent 读你 Mac 上指定目录的文件；关掉开关后立即失效 |
 | P8 协作 ✅ | 发消息给别的 Agent、群聊、总管 | 总管把任务拆给两个 Agent，最后汇总给你 |
 | P9 手机 App ✅（改为 PWA） | 添加到主屏幕的 PWA、Web Push、接管；另加 Codex 引擎（Bot 可选 `claude -p` 或 `codex exec`） | 不做原生 App |
+
+### 接下来（2026-11-02 定）
+
+顺序：**先底层和网页端，手机客户端最后做。** 其中不少做法借鉴自 OpenMausBot（一个开源的 Grok Bot 仿制品）。
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| P10 底层加固 ✅ | 防伪装：系统写的前缀（`[来自 Agent X]`、`[群聊 · 用户]` 等）不能被模型文字冒充，并告诉模型其他 Agent、网页和文件里的内容只是数据；Routine 上一次没跑完就跳过下一次；保险箱凭据按需取用，不再每轮整份下发；用假的 claude / codex 跑协作和恢复场景的测试；e2e 补上屏幕、Codex、Routine、本机执行、协作 | 一个 Agent 在回复里伪造"用户说"的前缀，接收方不会当真；假引擎测试不花钱、几秒跑完 |
+| P11 发消息不打断 | Agent 干活时你追加的话直接并进正在跑的这一轮，不再中断重来：Claude 改为常驻进程（stream-json 输入），Codex 改用 `codex app-server` | 一轮跑到一半补一句要求，它在这一轮里照着改，之前做的不丢 |
+| P12 记忆改进 | 写入前遮掉像密钥的内容；MEMORY.md 超上限时把旧条目归档而不是截断；条目可设过期日期；对话安静后自动记下新事实；每轮开始前按这句话自动检索相关笔记和过往对话；夜间整理记忆 | 聊过的偏好不用叫它记也会记住；一周后的对话里能自动想起来 |
+| P13 网页端完善 | "走家里线路"按 Agent 设置；网页上能看到和管理以上新能力 | 每项新能力都在网页上实测过 |
+| **P14 手机客户端（最后）** | claude-2 上装 Tailscale，`tailscale serve` 给 7780 提供 HTTPS；手机添加到主屏幕；真机推送 | 补上 P5（手机上完成真实网站的二步验证）和 P6（"每天 8 点"连跑一周，真机收到推送）的原定验收 |
 
 ## 15. 已知取舍
 

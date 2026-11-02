@@ -26,4 +26,7 @@ export const config = {
   sandboxNet: env('PAGENT_SANDBOX_NET', 'pagent_sandbox'),
   remotePort: Number(env('PAGENT_REMOTE_PORT', '7780')),
   webDir: env('PAGENT_WEB_DIR'),
+  // 测试用：直接连一个已经在跑的网关（不经过 docker 建盒子），见 test/engine.test.ts
+  boxUrl: process.env.PAGENT_BOX_URL || null,
+  boxToken: process.env.PAGENT_BOX_TOKEN || '',
 };

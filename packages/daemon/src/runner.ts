@@ -11,6 +11,8 @@ import { config } from './config.ts';
 import { prepareRun } from './plugins.ts';
 import { type CodexState, codexState, engineOf, fromCodex } from './engines.ts';
 import { allSecrets, redactor } from './vault.ts';
+import { type EnvelopeMeta, block, envelopeKey, escapeTags, render } from './envelope.ts';
+import { NO_NEWS } from './routines.ts';
 import { type MemSnap, diffFiles, guideFor, listGlobal, promptOf, readAgentFiles, snap, updateBlock } from './memory.ts';
 import type { RunStatus } from '../../protocol/src/types.ts';
 
@@ -111,8 +113,8 @@ export class Runner {
     if (this.active.has(botId)) return;
     const prep = this.store.tx(() => {
       const thread = this.currentThread(botId);
-      const msgs = this.store.all<{ id: number; content: string }>(
-        "SELECT id, content FROM messages WHERE thread_id = ? AND status = 'queued' ORDER BY id", thread.id);
+      const msgs = this.store.all<{ id: number; content: string; meta: string | null }>(
+        "SELECT id, content, meta FROM messages WHERE thread_id = ? AND status = 'queued' ORDER BY id", thread.id);
       if (msgs.length === 0) return null;
       const bot = this.store.get<BotRow>('SELECT * FROM bots WHERE id = ?', botId)!;
       const prev = this.store.get<RunRow>('SELECT * FROM runs WHERE thread_id = ? ORDER BY started_at DESC LIMIT 1', thread.id);
@@ -137,12 +139,13 @@ export class Runner {
       const unknown = prev
         ? this.store.all<ActionRow>("SELECT * FROM actions WHERE run_id = ? AND status = 'unknown' ORDER BY created_at", prev.id)
         : [];
+      const key = envelopeKey(this.store);
       const note = unknown.length
-        ? `[系统说明] 上一轮被中断，下面这些操作已经开始执行但没等到结果，请先核实它们实际是否完成：\n${
-          unknown.map((a) => `- ${a.tool}: ${summarize(a.tool, JSON.parse(a.input))}`).join('\n')}\n\n`
+        ? `${block(key, 'pagent-msg', { from: 'system' }, { note: `上一轮被中断，下面这些操作已经开始执行但没等到结果，请先核实它们实际是否完成：\n${
+          escapeTags(unknown.map((a) => `- ${a.tool}: ${summarize(a.tool, JSON.parse(a.input))}`).join('\n'))}` })}\n\n`
         : '';
       // 人设和记忆：新会话写进系统提示；老会话只补发变化（--resume 时新的系统提示不生效）
-      const cur = snap(bot.persona, guideFor(bot.name, `${agentDirInBox(bot.id)}/memory`), listGlobal(this.store),
+      const cur = snap(bot.persona, guideFor(bot.name, `${agentDirInBox(bot.id)}/memory`, key), listGlobal(this.store),
         readAgentFiles(agentMemoryDir(bot.id)).get('MEMORY.md') ?? null);
       let sys: string | null = null;
       let update = '';
@@ -150,19 +153,20 @@ export class Runner {
         sys = promptOf(cur);
         this.store.run('UPDATE threads SET mem_base = ?, mem_delivered = ? WHERE id = ?', JSON.stringify(cur), JSON.stringify(cur), thread.id);
       } else {
-        update = updateBlock(thread.mem_delivered ? JSON.parse(thread.mem_delivered) as MemSnap : null, cur);
+        update = updateBlock(thread.mem_delivered ? JSON.parse(thread.mem_delivered) as MemSnap : null, cur, key);
         if (update) this.store.run('UPDATE threads SET mem_delivered = ? WHERE id = ?', JSON.stringify(cur), thread.id);
       }
-      return { runId, token, thread, bot, sys, prompt: update + note + msgs.map((m) => m.content).join('\n\n') };
+      const body = msgs.map((m) => render(key, m.content, m.meta ? JSON.parse(m.meta) as EnvelopeMeta : null, NO_NEWS)).join('\n\n');
+      return { runId, token, thread, bot, sys, key, prompt: update + note + body };
     });
     if (!prep) return;
     if (prep === 'skipped') return this.kick(botId);
-    const { runId, token, thread, bot } = prep;
+    const { runId, token, thread, bot, key } = prep;
     const engine = engineOf(bot.engine);
     let { sys, prompt } = prep;
     // Codex 没有追加系统提示的参数：新会话第一轮把人设和记忆放在消息开头（之后照样只补发变化）
     if (engine === 'codex' && sys) {
-      prompt = `<pagent-context>\n以下是你的人设、工作方式和记忆，以此为准。\n\n${sys}\n</pagent-context>\n\n${prompt}`;
+      prompt = `<pagent-context key="${key}">\n以下是你的人设、工作方式和记忆，以此为准。\n\n${sys}\n</pagent-context>\n\n${prompt}`;
       sys = null;
     }
     const memDir = agentMemoryDir(bot.id);
@@ -197,11 +201,10 @@ export class Runner {
         },
       },
     };
-    const secrets = allSecrets(this.store);
-    entry.redact = redactor(secrets);
+    entry.redact = redactor(allSecrets(this.store));
     try {
       const r = await gw<{ boot: string }>(box, 'POST', '/api/runTurn', {
-        engine, agentId: bot.id, runId, prompt, systemPrompt: sys, sessionId: thread.session_id, mcpConfig, secrets,
+        engine, agentId: bot.id, runId, prompt, systemPrompt: sys, sessionId: thread.session_id, mcpConfig,
         model: bot.model, maxTurns: bot.max_turns, pluginDirs: plugins.pluginDirs, maxSeconds: bot.max_run_seconds,
       });
       entry.boot = r.boot;

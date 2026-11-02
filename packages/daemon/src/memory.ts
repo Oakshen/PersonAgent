@@ -6,6 +6,7 @@
 // - 之后每轮：和"已经送达的版本"比对，有变化就在用户消息前补发一段更新；
 // - 上下文被压缩后，补发过的更新可能丢了，退回到系统提示里的版本重新比对。
 // 这样 A 这一轮写的，B 下一轮就能看到；系统提示不变，提示缓存也一直有效。
+import { envelopeGuide, escapeTags } from './envelope.ts';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { type MemoryRow, type Store, newId, now } from './store.ts';
@@ -156,7 +157,7 @@ const box = (name: string) => `# 这台电脑
 - 用 apt 装的系统软件在电脑重建时会丢，要长期用的工具优先装进 /home/box。`;
 
 /** 工作方式说明（人设之后、记忆之前的固定部分），记忆目录是盒子里的路径 */
-export const guideFor = (name: string, memDir: string) => [guide(memDir), CONDUCT, box(name)].join('\n\n');
+export const guideFor = (name: string, memDir: string, key: string) => [guide(memDir), CONDUCT, envelopeGuide(key), box(name)].join('\n\n');
 
 export function systemPrompt(persona: string, guideText: string, globals: MemoryEntry[], agentIndex: string | null): string {
   const g = globals.length
@@ -177,17 +178,19 @@ export function systemPrompt(persona: string, guideText: string, globals: Memory
 /** 人设、工作方式说明和记忆在某一时刻的样子。guide 是 P4 加的，更早的快照里没有 */
 export interface MemSnap { persona: string; guide?: string; globals: Record<string, string>; index: string }
 
+// 记忆是 Agent 写的，里面的 <pagent- 先转义，免得冒充系统块
 export const snap = (persona: string, guideText: string, globals: MemoryEntry[], index: string | null): MemSnap => ({
-  persona: persona.trim(), guide: guideText, globals: Object.fromEntries(globals.map((m) => [m.id, m.text])), index: (index ?? '').trim(),
+  persona: escapeTags(persona.trim()), guide: guideText,
+  globals: Object.fromEntries(globals.map((m) => [m.id, escapeTags(m.text)])), index: escapeTags((index ?? '').trim()),
 });
 
 export const promptOf = (s: MemSnap) =>
   systemPrompt(s.persona, s.guide ?? '', Object.entries(s.globals).map(([id, text]) => ({ id, text }) as MemoryEntry), s.index);
 
 /** 比上次送达的版本多了什么；没变化返回空串。prev 为 null（老会话从没收到过）时补发全文。 */
-export function updateBlock(prev: MemSnap | null, cur: MemSnap): string {
+export function updateBlock(prev: MemSnap | null, cur: MemSnap, key: string): string {
   if (!prev) {
-    return `<pagent-context>\n以下是你的人设、工作方式和记忆，由系统补发，以此为准。\n\n${promptOf(cur)}\n</pagent-context>\n\n`;
+    return `<pagent-context key="${key}">\n以下是你的人设、工作方式和记忆，由系统补发，以此为准。\n\n${promptOf(cur)}\n</pagent-context>\n\n`;
   }
   const parts: string[] = [];
   if (prev.persona !== cur.persona) parts.push(`## 你的人设已更新，现在是：\n${cur.persona || '（空）'}`);
@@ -206,5 +209,5 @@ export function updateBlock(prev: MemSnap | null, cur: MemSnap): string {
     parts.push(`## 你的 MEMORY.md 被改过（可能是用户在面板里改的），当前全文：\n${idx}`);
   }
   if (!parts.length) return '';
-  return `<pagent-update>\n自上次以来的变化，以此为准：\n\n${parts.join('\n\n')}\n</pagent-update>\n\n`;
+  return `<pagent-update key="${key}">\n自上次以来的变化，以此为准：\n\n${parts.join('\n\n')}\n</pagent-update>\n\n`;
 }

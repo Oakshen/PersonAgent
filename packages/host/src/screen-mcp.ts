@@ -36,7 +36,7 @@ const TOOLS = [
 
 const text = (t: string, isError = false) => ({ content: [{ type: 'text', text: t }], isError });
 
-export async function screenTool(screens: Screens, agentId: string, name: string, a: any, secrets: Record<string, string> = {}): Promise<unknown> {
+export async function screenTool(screens: Screens, agentId: string, name: string, a: any, getSecret: (name: string) => Promise<string>): Promise<unknown> {
   const s = screens.get(agentId);
   if (s.takenOver) return text('用户正在接管你的屏幕，屏幕工具暂停。等用户交还后再继续。', true);
   screens.touch(agentId);
@@ -66,8 +66,8 @@ export async function screenTool(screens: Screens, agentId: string, name: string
       await screens.xdotool(agentId, ['type', '--delay', '20', '--', String(a.text ?? '')]);
       return text('已输入');
     case 'fill_secret': {
-      const v = secrets[String(a.name ?? '')];
-      if (v === undefined) return text(`保险箱里没有 ${a.name}。可用的：${Object.keys(secrets).join('、') || '（空）'}`, true);
+      let v: string;
+      try { v = await getSecret(String(a.name ?? '')); } catch (e) { return text((e as Error).message, true); }
       await screens.xdotool(agentId, ['type', '--delay', '20', '--', v]);
       if (a.enter) await screens.xdotool(agentId, ['key', 'Return']);
       return text(`已输入 ${a.name}（值没有显示）`);

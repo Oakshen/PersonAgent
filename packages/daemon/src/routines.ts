@@ -148,18 +148,28 @@ export function deleteRoutine(store: Store, id: string, by: string): void {
 // ---- 触发 ----
 
 /** 把 Routine 作为一条消息放进 Agent 当前会话的队列 */
+/**
+ * 触发：往 Agent 当前的会话排一条消息（正文是用户设定的任务，封套由系统在发给 Agent 时写）。
+ * 上一次触发的还在排队或还在跑，这次就跳过，免得任务慢的时候越积越多。
+ */
 export function fireRoutine(store: Store, runner: Runner, r: RoutineRow, trigger: 'schedule' | 'webhook' | 'manual', payload?: string) {
-  const text = [
-    `[Routine「${r.name}」· ${{ schedule: '定时触发', webhook: 'webhook 触发', manual: '手动运行' }[trigger]}]`,
-    r.prompt,
-    payload ? `\n触发时附带的数据：\n${payload.slice(0, 16_000)}` : '',
-    `\n（这是自动运行的任务，用户此刻不一定在看。如果和上次相比没有值得告诉用户的新内容，只回复 ${NO_NEWS} 这一个词，不要别的；有新内容就直接汇报结论。）`,
-  ].filter(Boolean).join('\n');
+  const busy = store.get<{ id: number }>(
+    `SELECT m.id FROM messages m LEFT JOIN runs u ON u.id = m.run_id
+     WHERE json_extract(m.meta, '$.routine.id') = ? AND (m.status = 'queued' OR u.status = 'running') LIMIT 1`, r.id);
+  if (busy) {
+    store.tx(() => {
+      store.run('UPDATE routines SET last_fired_at = ? WHERE id = ?', now(), r.id);
+      store.emit('routine.fired', { phase: 'skipped', routineId: r.id, name: r.name, trigger, reason: '上一次还没跑完' }, { botId: r.bot_id });
+    });
+    return { skipped: true as const };
+  }
   store.tx(() => {
     store.run('UPDATE routines SET last_fired_at = ? WHERE id = ?', now(), r.id);
     store.emit('routine.fired', { phase: 'start', routineId: r.id, name: r.name, trigger }, { botId: r.bot_id });
   });
-  return runner.enqueue(r.bot_id, text, { routine: { id: r.id, name: r.name, trigger } });
+  return runner.enqueue(r.bot_id, r.prompt, {
+    kind: 'routine', routine: { id: r.id, name: r.name, trigger }, ...(payload ? { payload: payload.slice(0, 16_000) } : {}),
+  });
 }
 
 export function fireByWebhook(store: Store, runner: Runner, token: string, payload: string) {

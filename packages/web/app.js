@@ -496,9 +496,11 @@ function renderEvent(e, ctx) {
       if (/^\W*NO_NEWS\W*$/.test(d.text)) return null;
       return h('div', { class: 'say' }, md(d.text));
     case 'routine.fired':
+      if (d.phase === 'skipped') return h('div', { class: 'step note' }, `Routine「${d.name}」${d.trigger === 'schedule' ? '到点了' : d.trigger === 'webhook' ? '被 webhook 触发' : '手动运行'}，但上一次还没跑完，这次跳过`);
       return d.phase === 'done' && d.quiet ? h('div', { class: 'step note' }, `Routine「${d.name}」跑完了：没有新内容，没打扰你`) : null;
     case 'routine.changed':
       return h('div', { class: 'step note' }, `${d.by} ${{ create: '新建了', update: '修改了', delete: '删掉了' }[d.op]} Routine「${d.name}」${d.when ? `（${d.when}）` : ''}`);
+    case 'secret.used': return h('div', { class: 'step note' }, `取用了保险箱里的 ${d.name}`);
     case 'notify': return h('div', { class: 'notify-line' }, h('b', {}, '通知了你 · '), `${d.title}${d.body ? `：${d.body}` : ''}`);
     case 'screen.takeover': return h('div', { class: 'step note' }, d.on ? `${d.by} 接管了屏幕` : `${d.by} 交还了屏幕`);
     case 'agent.message': return h('div', { class: 'step note' }, `给 ${d.to} 发了消息：${String(d.text).slice(0, 80)}`);
@@ -758,7 +760,7 @@ function renderRoutines() {
       h('p', { class: 'r-prompt' }, r.prompt),
       h('div', { class: 'fact-meta' },
         r.nextAt ? `下次 ${timeLabel(r.nextAt)}` : null, r.lastFiredAt ? ` · 上次 ${timeLabel(r.lastFiredAt)}` : null, ` · ${r.createdBy} 建的`,
-        h('button', { class: 'link', onclick: async () => { try { await api('POST', `/api/routines/${r.id}/run`); toast('已开始运行'); openBot(b); } catch (e) { toast(e.message); } } }, '现在运行'),
+        h('button', { class: 'link', onclick: async () => { try { const res = await api('POST', `/api/routines/${r.id}/run`); if (res?.skipped) return toast('上一次还没跑完，这次跳过了'); toast('已开始运行'); openBot(b); } catch (e) { toast(e.message); } } }, '现在运行'),
         h('button', { class: 'link', onclick: async () => { if (!confirm(`删除「${r.name}」？`)) return; try { await api('DELETE', `/api/routines/${r.id}`); await openRoutines(b); } catch (e) { toast(e.message); } } }, '删除')),
       r.webhook ? h('div', { class: 'webhook' }, 'Webhook：', h('code', {}, `POST ${location.origin}${r.webhook}`)) : null));
   }

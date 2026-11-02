@@ -1,7 +1,7 @@
 // 保险箱：密码和 token 在 pagentd 加密保存（AES-256-GCM，密钥文件只在数据目录里）。
-// 每一轮整份交给盒子（同 Grok 的 setBoxSecrets：要么整份生效，要么不生效）：
-// - 作为环境变量给 Agent 的命令用（$NAME）；
-// - 网页登录时 Agent 调 screen 的 fill_secret，由网关直接把值打进输入框，不经过模型。
+// 按需取用，不再整份下发：凭这一轮的令牌向 pagentd 一条一条取（mcp.ts 的 /secret），每次取用记一条 secret.used。
+// - 命令里用盒子里的 pagent-secret 命令：$(pagent-secret NAME)；
+// - 网页登录时 Agent 调 screen 的 fill_secret，由网关取到值直接打进输入框，不经过模型。
 // 时间线上出现的值会被遮住。
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';

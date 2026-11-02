@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+import { main } from "./fake-engine.mjs";
+await main("codex");

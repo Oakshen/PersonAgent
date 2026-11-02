@@ -61,6 +61,11 @@ export function ensureBox(): Promise<Box> {
 }
 
 async function doEnsure(): Promise<Box> {
+  if (config.boxUrl) {
+    const box = { gatewayUrl: config.boxUrl, gatewayToken: config.boxToken };
+    await waitHealthy(box);
+    return box;
+  }
   const gatewayUrl = `http://${BOX_NAME}:${GATEWAY_PORT}`;
   let token: string | null = null;
   try { token = readFileSync(tokenFile(), 'utf8').trim() || null; } catch {}

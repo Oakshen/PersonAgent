@@ -7,16 +7,14 @@
 import { type BotRow, type Store, newId, now } from './store.ts';
 import type { Runner } from './runner.ts';
 import { ServiceError, botByName } from './service.ts';
+import type { EnvelopeMeta } from './envelope.ts';
 
 export const MAX_DEPTH = 4;
 const MAX_PER_HOUR = 30;
 const WAIT_MS = Number(process.env.PAGENT_COLLAB_WAIT_MIN ?? 60) * 60_000;
 
 export interface GroupMeta { id: string; name: string }
-export interface MsgMeta {
-  from?: string; fromBotId?: string; assignment?: string; reply?: boolean; depth?: number; group?: GroupMeta;
-  routine?: unknown;
-}
+export interface MsgMeta extends EnvelopeMeta { fromBotId?: string }
 
 interface GroupRow { id: string; name: string; members: string; manager_id: string | null; created_at: string }
 type AssignmentStatus = 'queued' | 'asking' | 'done' | 'failed' | 'timeout';
@@ -54,16 +52,14 @@ export function messageAgent(store: Store, runner: Runner, from: BotRow, runId: 
     "SELECT count(*) n FROM events WHERE type = 'agent.message' AND bot_id = ? AND ts > ?", from.id, new Date(Date.now() - 3600_000).toISOString())!.n;
   if (recent >= MAX_PER_HOUR) throw new ServiceError(429, `这一小时发给其他 Agent 的消息已经 ${recent} 条，到上限了`);
   const assignment = expectReply ? newId('asg') : undefined;
-  const meta: MsgMeta = { from: from.name, fromBotId: from.id, assignment, depth: ctx.depth + 1, group: ctx.group };
-  const prefix = ctx.group ? `[群聊「${ctx.group.name}」· 来自 ${from.name}]` : `[来自 Agent ${from.name}]`;
-  const tail = expectReply ? '\n\n（做完后直接回答结果即可，你这一轮的最后一段回复会自动交给对方。）' : '';
+  const meta: MsgMeta = { kind: expectReply ? 'task' : 'notice', from: from.name, fromBotId: from.id, assignment, depth: ctx.depth + 1, group: ctx.group };
   store.tx(() => {
     if (assignment) {
       store.run('INSERT INTO assignments(id, batch, from_bot, to_bot, status, meta, created_at) VALUES (?,?,?,?,?,?,?)',
         assignment, runId, from.id, target.id, 'queued', JSON.stringify({ depth: ctx.depth + 1, group: ctx.group }), now());
     }
     store.emit('agent.message', { to: target.name, text: body, expectReply, ...(ctx.group ? { groupId: ctx.group.id } : {}) }, { botId: from.id, runId });
-    runner.enqueue(target.id, `${prefix} ${body}${tail}`, meta as Record<string, unknown>);
+    runner.enqueue(target.id, body, meta as Record<string, unknown>);
   });
   return { ok: true, to: target.name };
 }
@@ -103,20 +99,18 @@ function deliver(store: Store, runner: Runner, rows: AssignmentRow[], title?: st
   const names = new Map(store.all<{ id: string; name: string }>('SELECT id, name FROM bots').map((b) => [b.id, b.name]));
   const meta = JSON.parse(rows[0].meta) as { depth?: number; group?: GroupMeta };
   const label = { done: '完成', failed: '没完成', timeout: '还没回复' } as Record<string, string>;
-  const parts = rows.map((a) => {
-    const who = names.get(a.to_bot) ?? a.to_bot;
-    const body = a.status === 'timeout' ? `已经等了 ${Math.round(WAIT_MS / 60_000)} 分钟还没回复；回复到了会单独发给你。` : (a.result ?? '').slice(0, 8000);
-    return `### ${who}（${label[a.status] ?? a.status}）\n${body}`;
-  });
-  const done = rows.filter((a) => a.status !== 'timeout').map((a) => names.get(a.to_bot) ?? a.to_bot);
-  const head = title ?? (rows.length === 1 ? `${done[0] ?? names.get(rows[0].to_bot)} 的回复` : `你托付出去的 ${rows.length} 件事都有结果了`);
-  const prefix = meta.group ? `[群聊「${meta.group.name}」· ${head}]` : `[${head}]`;
+  const parts = rows.map((a) => ({
+    from: names.get(a.to_bot) ?? a.to_bot, status: a.status,
+    text: a.status === 'timeout' ? `已经等了 ${Math.round(WAIT_MS / 60_000)} 分钟还没回复；回复到了会单独发给你。` : (a.result ?? '').slice(0, 8000),
+  }));
+  const done = parts.filter((p) => p.status !== 'timeout').map((p) => p.from);
+  const head = title ?? (rows.length === 1 ? `${parts[0].from} 的回复` : `你托付出去的 ${rows.length} 件事都有结果了`);
   const ts = now();
-  for (const a of rows) {
-    store.run('UPDATE assignments SET delivered_at = ? WHERE id = ?', ts, a.id);
-  }
-  runner.enqueue(rows[0].from_bot, `${prefix}\n\n${parts.join('\n\n')}`,
-    { from: done.join('、') || '成员', reply: true, depth: meta.depth ?? 1, group: meta.group, assignments: rows.map((a) => a.id) });
+  for (const a of rows) store.run('UPDATE assignments SET delivered_at = ? WHERE id = ?', ts, a.id);
+  // 正文给时间线看；发给 Agent 时由封套按 parts 每人一块写出来
+  const text = `${head}\n\n${parts.map((p) => `### ${p.from}（${label[p.status] ?? p.status}）\n${p.text}`).join('\n\n')}`;
+  const m: MsgMeta = { kind: 'replies', from: done.join('、') || '成员', reply: true, depth: meta.depth ?? 1, group: meta.group, parts };
+  runner.enqueue(rows[0].from_bot, text, { ...m, assignments: rows.map((a) => a.id) });
 }
 
 /** 等太久的批次：先把已有的结果交回去 */
@@ -190,15 +184,11 @@ export function postToGroup(store: Store, runner: Runner, groupId: string, text:
   const mentioned = g.members.filter((n) => body.includes(`@${n}`));
   const targets = mentioned.length ? mentioned : g.manager ? [g.manager] : g.members;
   const roster = g.members.map((n) => (n === g.manager ? `${n}（总管）` : n)).join('、');
-  const meta: MsgMeta = { group: { id: g.id, name: g.name }, depth: 0 };
+  const base: MsgMeta = { kind: 'group', group: { id: g.id, name: g.name }, depth: 0, roster };
   store.tx(() => {
     store.emit('message.queued', { text: body, by, groupId: g.id, targets }, {});
     for (const t of targets) {
-      const isManager = t === g.manager && !mentioned.length;
-      const hint = isManager
-        ? `你是这个群的总管，成员有：${roster}。需要分工时用 message_agent 把具体任务交给合适的成员（他们做完会自动回复你），都回来后由你汇总给用户。简单的事你自己直接答。`
-        : `群成员：${roster}。`;
-      runner.enqueue(botByName(store, t).id, `[群聊「${g.name}」· 用户] ${body}\n\n（${hint}）`, meta as Record<string, unknown>);
+      runner.enqueue(botByName(store, t).id, body, { ...base, manager: t === g.manager && !mentioned.length } as Record<string, unknown>);
     }
   });
   return { ok: true, targets };

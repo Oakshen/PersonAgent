@@ -80,8 +80,13 @@ export function botStatus(store: Store, botId: string): BotStatus {
 export function snapshot(store: Store) {
   return {
     bots: store.all<BotRow>('SELECT * FROM bots ORDER BY created_at').map((b) => {
-      const last = store.get<{ ts: string; type: string; data: string }>(
-        "SELECT ts, type, data FROM events WHERE bot_id = ? AND type IN ('assistant.text', 'message.queued') ORDER BY seq DESC LIMIT 1", b.id);
+      // Routine 排进来的任务和安静收尾的 NO_NEWS 都不算最后一句话
+      const last = store.all<{ ts: string; type: string; data: string }>(
+        "SELECT ts, type, data FROM events WHERE bot_id = ? AND type IN ('assistant.text', 'message.queued') ORDER BY seq DESC LIMIT 20", b.id)
+        .find((e) => {
+          const d = JSON.parse(e.data);
+          return e.type === 'assistant.text' ? !/^\W*NO_NEWS\W*$/.test(d.text ?? '') : !d.meta?.routine;
+        });
       return {
         id: b.id, name: b.name, persona: b.persona, model: b.model, engine: engineOf(b.engine), createdAt: b.created_at, status: botStatus(store, b.id), waitingOn: waitingOn(store, b.id),
         lastText: last ? String(JSON.parse(last.data).text ?? '').slice(0, 120) : null,

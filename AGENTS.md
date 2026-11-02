@@ -19,7 +19,11 @@ node --test packages/daemon/test/core.test.ts              # 单个文件
 node --test --test-name-pattern='协作' packages/daemon/test/core.test.ts   # 单个用例（按名字匹配）
 PAGENT_E2E_BOT=tester node --test --test-timeout=560000 packages/daemon/test/remote.e2e.ts
                                                            # 端到端：对着运行中的 pagentd，会真的跑几轮模型，十几分钟
+node --test --test-timeout=600000 packages/daemon/test/features.e2e.ts
+                                                           # 端到端：保险箱、Routine、本机执行、屏幕、Codex、群聊协作
 ```
+
+`engine.test.ts` 用假的 claude / codex（`test/fake/`，消息里写 `@@say` / `@@sh` / `@@mcp` 等指挥它）跑真的网关和 pagentd，不调模型，几秒跑完；改了轮次、协作、恢复、封套相关的代码先跑它。
 
 `tsconfig` 开了 `erasableSyntaxOnly` 和 `allowImportingTsExtensions`：不能用 enum、namespace、构造函数参数属性；相对导入要写 `.ts` 后缀。
 
@@ -84,9 +88,11 @@ ssh claude-2 'docker restart pagent-box'      # 改了 packages/host（盒子里
 
 ### 其他要知道的
 
-- **两层记忆**：全局记忆（关于用户，所有 Agent 共享）在数据库里；Agent 记忆是盒子里它配置目录下的 `memory/` 文件。会话中途的变化通过 `<pagent-update>` 补发，不改系统提示（`threads.mem_base` / `mem_delivered`）。
+- **两层记忆**：全局记忆（关于用户，所有 Agent 共享）在数据库里；Agent 记忆是盒子里它配置目录下的 `memory/` 文件。会话中途的变化通过带密钥的 `<pagent-update>` 补发，不改系统提示（`threads.mem_base` / `mem_delivered`）。
 - **引擎**：每个 Bot 选 `claude` 或 `codex`；换引擎会开新会话。Codex 没有系统提示参数，新会话第一轮把系统提示放进 `<pagent-context>`。所有 Codex Bot 共用一个 `CODEX_HOME`（一份登录）。
 - **订阅凭据**：Claude 复用宿主的 `~/.claude/.credentials.json`（单文件挂进盒子）。CLI 刷新令牌会把链接换成独立文件，网关的 `syncCred()` 以最新的一份为准写回并恢复链接。
+- **消息封套**（`envelope.ts`）：消息表只存正文，来源放在 `messages.meta`；发给 Agent 时 runner 按 meta 写带安装密钥的 `<pagent-msg key from=…>` 块，正文里的 `<pagent-` 一律转义。**不要再往正文里拼 `[来自 …]` 之类的前缀**，加新的消息来源就加 meta 字段和 `render` 分支。
+- **保险箱**：凭据不进环境变量。Agent 在命令里用 `$(pagent-secret 名字)` 现取（`packages/host/bin/pagent-secret` → MCP 服务的 `POST /secret`，凭本轮 run token），每次取用记 `secret.used`。
 - **协作**：同一轮里 `message_agent` 托付出去的事算一批，全部有结果后合成一条消息交回发起方（`assignments` 表）。
 - **远程 API**（`remote.ts`）：设备用 ECDSA 密钥配对和登录，权限分 `chat` / `admin` / `local`；只有 `local` 的设备只能访问本机执行的路由。
 
